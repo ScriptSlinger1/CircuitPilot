@@ -1,8 +1,10 @@
 from django.urls import path
-from .views import test_view
+from .views import (LandingPageView,
+                    main_func_temp)
 
 app_name = 'cpai'
 
 urlpatterns = [
-    path('', test_view, name='test_view'),
+    path('', LandingPageView.as_view(), name='test_view'),
+    path('main/', main_func_temp, name='main'),
 ]

@@ -1,0 +1,288 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>CircuitPilot: describe a system, watch it come alive in 3D</title>
+<meta name="description" content="CircuitPilot turns plain language into a component diagram, simulates it, and flags design errors before anything physical exists.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500&family=Sora:wght@600;800&display=swap">
+<style>
+:root{--bg:#060912;--panel:#0C1222;--line:#1B2848;--text:#E8F0FF;--muted:#93A6CC;--blue:#19B5FF;--orange:#FF7A1A;--orange2:#FF4D00;--mx:50vw;--my:30vh;color-scheme:dark;box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}
+html{background:var(--bg);scroll-behavior:smooth;scroll-padding-top:calc(5rem + env(safe-area-inset-top,0px))}
+*,*::before,*::after{box-sizing:inherit}
+body{margin:0;background:var(--bg);color:var(--text);font:400 1.05rem/1.65 "DM Sans",system-ui,sans-serif;overflow-x:hidden}
+body::after{content:"";position:fixed;inset:0;pointer-events:none;z-index:30;background:radial-gradient(480px circle at var(--mx) var(--my),rgba(25,181,255,.1),transparent 60%)}
+h1,h2,h3,.ui,button,nav{font-family:Sora,"Helvetica Neue",Arial,sans-serif}
+h1,h2,h3{margin:0;letter-spacing:-.02em;line-height:1.05}
+h1{font-weight:800;font-size:clamp(2.5rem,5.6vw,4.6rem);max-width:13ch}
+h2{font-weight:800;font-size:clamp(1.9rem,4vw,2.9rem);margin-bottom:.5em}
+h3{font-weight:600;font-size:1.3rem;margin-bottom:.4rem}
+p{margin:0 0 1em;max-width:58ch}
+.grad{background:linear-gradient(90deg,var(--blue),var(--orange));-webkit-background-clip:text;background-clip:text;color:transparent}
+:focus-visible{outline:3px solid var(--orange);outline-offset:3px;border-radius:4px}
+.wrap{width:min(1140px,100% - 2.5rem);margin-inline:auto}
+header{position:fixed;top:0;left:0;right:0;z-index:20;padding-top:env(safe-area-inset-top,0px);background:rgba(6,9,18,.7);backdrop-filter:blur(14px);border-bottom:1px solid var(--line)}
+header .wrap{display:flex;align-items:center;justify-content:space-between;height:4rem}
+.brand{display:flex;align-items:center;gap:.6rem;font:800 1.2rem/1 Sora,sans-serif;color:var(--text);text-decoration:none}
+nav{display:flex;align-items:center;gap:1.6rem}
+nav a{color:var(--muted);text-decoration:none;font-weight:600;font-size:.9rem}
+nav a:hover{color:var(--text)}
+.btn{display:inline-block;border:0;border-radius:8px;padding:.85rem 1.25rem;font:600 .95rem/1 Sora,sans-serif;cursor:pointer;text-decoration:none;color:#140800;background:linear-gradient(90deg,var(--orange),var(--orange2));box-shadow:0 0 26px rgba(255,122,26,.45);transition:transform .15s,box-shadow .15s}
+.btn:hover{transform:translateY(-2px);box-shadow:0 0 36px rgba(255,122,26,.7)}
+.btn.blue{background:transparent;color:var(--blue);border:1.5px solid var(--blue);box-shadow:0 0 20px rgba(25,181,255,.3)}
+.btn.blue:hover{box-shadow:0 0 30px rgba(25,181,255,.6)}
+.btn:disabled{opacity:.5;cursor:default;transform:none}
+.hero{position:relative;min-height:max(100svh,860px);overflow:hidden;display:flex;align-items:flex-start}
+.hero::before{content:"";position:absolute;inset:0;background:linear-gradient(rgba(25,181,255,.07) 1px,transparent 1px) 0 0/56px 56px,linear-gradient(90deg,rgba(25,181,255,.07) 1px,transparent 1px) 0 0/56px 56px;-webkit-mask-image:radial-gradient(ellipse at 70% 50%,#000,transparent 70%);mask-image:radial-gradient(ellipse at 70% 50%,#000,transparent 70%)}
+#gl{position:absolute;inset:0;width:100%;height:100%;touch-action:pan-y;cursor:grab}
+.copy{position:relative;z-index:2;padding-top:7.5rem;pointer-events:none;max-width:560px}
+.copy a,.copy button,.copy input{pointer-events:auto}
+.copy p.lead{color:var(--muted);font-size:1.12rem;margin:1.2rem 0 1.5rem}
+.row{display:flex;flex-wrap:wrap;gap:.7rem}
+.prompt{display:flex;gap:.5rem;margin-top:1.6rem;border:1px solid var(--line);background:rgba(12,18,34,.85);border-radius:10px;padding:.4rem;backdrop-filter:blur(8px)}
+.prompt input{flex:1;min-width:0;border:0;background:none;color:var(--text);font:inherit;font-size:.95rem;padding:.5rem .7rem}
+.prompt .btn{padding:.7rem 1rem;white-space:nowrap}
+.hud{display:flex;flex-wrap:wrap;gap:.6rem;margin-top:1rem}
+.chip{border:1px solid var(--line);background:rgba(12,18,34,.85);border-radius:8px;padding:.45rem .8rem;font:600 .8rem/1.2 Sora,sans-serif;color:var(--muted)}
+.chip b{display:block;font-size:1.15rem;color:var(--text)}
+.chip.ok b{color:var(--blue)}.chip.bad{border-color:var(--orange2)}.chip.bad b{color:var(--orange)}
+#msg{margin:.9rem 0 0;font-size:.92rem;min-height:3.3em;color:var(--muted)}
+#msg.bad{color:var(--orange)}
+#info{margin:0;font-size:.85rem;color:var(--muted);max-width:44ch}
+#tip{position:fixed;z-index:25;pointer-events:none;background:rgba(12,18,34,.95);border:1px solid var(--blue);border-radius:8px;padding:.5rem .75rem;font-size:.85rem;max-width:230px;opacity:0;transition:opacity .15s;box-shadow:0 0 20px rgba(25,181,255,.35)}
+#tip b{display:block;font:600 .9rem Sora,sans-serif;color:var(--blue)}
+section{padding-block:5.5rem;position:relative}
+.cards{display:grid;gap:1.4rem;margin-top:2.2rem;perspective:1000px}
+.tilt{--gx:50%;--gy:50%;position:relative;padding:1.6rem;border-radius:14px;border:1px solid transparent;background:radial-gradient(260px circle at var(--gx) var(--gy),rgba(255,122,26,.16),transparent 60%) padding-box,linear-gradient(var(--panel),var(--panel)) padding-box,linear-gradient(135deg,var(--blue),var(--orange)) border-box;transition:transform .15s;transform-style:preserve-3d}
+.tilt .n{display:block;font:800 3.4rem/1 Sora,sans-serif;margin-bottom:.8rem;transform:translateZ(40px)}
+.tilt p{color:var(--muted);margin:0;transform:translateZ(20px)}
+.sample{margin-top:1rem;font-size:.9rem;color:var(--text);border-left:3px solid var(--orange);padding-left:.8rem}
+.lab{display:grid;gap:1.5rem;margin-top:2rem}
+[role=tablist]{display:flex;flex-direction:column;gap:.5rem}
+[role=tab]{text-align:left;background:var(--panel);color:var(--muted);border:1px solid var(--line);border-radius:8px;padding:.9rem 1rem;font:600 1rem Sora,sans-serif;cursor:pointer;transition:all .15s}
+[role=tab]:hover{color:var(--text);border-color:var(--blue)}
+[role=tab][aria-selected=true]{color:var(--text);border-color:var(--orange);box-shadow:0 0 22px rgba(255,122,26,.3),inset 3px 0 0 var(--orange)}
+[role=tabpanel]{border:1px solid var(--line);border-radius:14px;padding:2rem;background:var(--panel);min-height:12rem;display:flex;flex-direction:column;justify-content:center}
+[role=tabpanel] h3{font-size:1.8rem}
+[role=tabpanel] p{color:var(--muted);margin:0}
+.band{margin-block:2rem 5rem;padding:3rem clamp(1.4rem,5vw,3.5rem);border-radius:18px;border:1px solid transparent;background:linear-gradient(var(--panel),var(--panel)) padding-box,linear-gradient(120deg,var(--blue),var(--orange)) border-box;box-shadow:0 0 60px rgba(25,181,255,.12)}
+.band p{color:var(--muted)}
+form{display:flex;flex-wrap:wrap;gap:.7rem;margin-top:1.3rem;max-width:34rem}
+input[type=email]{flex:1 1 15rem;min-width:0;font:inherit;padding:.85rem 1rem;border:1.5px solid var(--line);border-radius:8px;background:var(--bg);color:var(--text)}
+input[type=email]:focus{border-color:var(--blue)}
+input[aria-invalid=true]{border-color:var(--orange2)}
+#fmsg{margin:.9rem 0 0;min-height:1.7em}#fmsg.bad{color:var(--orange)}#fmsg.ok{color:var(--blue)}
+footer{padding-block:1.8rem 2.5rem;color:var(--muted);font-size:.9rem;border-top:1px solid var(--line)}
+@media (min-width:900px){.cards{grid-template-columns:repeat(3,1fr)}.lab{grid-template-columns:20rem 1fr}}
+@media (max-width:700px){nav a:not(.btn){display:none}.hero{min-height:1020px}}
+@media (prefers-reduced-motion:reduce){html{scroll-behavior:auto}.btn,.tilt{transition:none}}
+</style>
+</head>
+<body>
+<header>
+ <div class="wrap">
+  <a class="brand" href="#top" aria-label="CircuitPilot home">
+   <svg width="26" height="26" viewBox="0 0 26 26" aria-hidden="true"><defs><linearGradient id="lg" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#19B5FF"/><stop offset="1" stop-color="#FF7A1A"/></linearGradient></defs><path d="M13 2l9.5 5.5v11L13 24 3.5 18.5v-11z" fill="none" stroke="url(#lg)" stroke-width="2.2"/><circle cx="13" cy="13" r="3" fill="#FF7A1A"/></svg>
+   CircuitPilot
+  </a>
+  <nav aria-label="Main"><a href="#how">How it works</a><a href="#catches">What it catches</a><a class="btn" href="#waitlist">Join the waitlist</a></nav>
+ </div>
+</header>
+
+<main id="top">
+ <div class="hero">
+  <canvas id="gl" aria-label="Interactive 3D model of a water tank, pump, float switches and controller. Drag to rotate."></canvas>
+  <div class="wrap" style="position:relative;pointer-events:none">
+   <div class="copy">
+    <h1>Describe a system. Watch it <span class="grad">come alive</span> in 3D.</h1>
+    <p class="lead">CircuitPilot turns plain language into a component diagram, simulates it, and flags design errors before anything physical exists.</p>
+    <div class="row"><a class="btn" href="#waitlist">Join the waitlist</a><a class="btn blue" href="#how">See how it works</a></div>
+    <div class="prompt"><label for="pr" hidden>Sample prompt</label><input id="pr" readonly value=""><button class="btn blue" id="gen" type="button">Generate design</button></div>
+    <div class="hud">
+     <div class="chip"><span>Tank level</span><b id="lvl">0%</b></div>
+     <div class="chip"><span>Pump</span><b id="pst">Off</b></div>
+     <div class="chip ok" id="chk"><span>Design checks</span><b id="cst">Passing</b></div>
+    </div>
+    <p id="msg" aria-live="polite">The pump starts at the low float and stops at the high float.</p>
+    <div class="row">
+     <button class="btn" id="fault" type="button" aria-pressed="false">Disconnect high float</button>
+     <button class="btn blue" id="run" type="button">Pause simulation</button>
+    </div>
+    <p id="info" style="margin-top:1rem">Drag to rotate. Hover a part for details. Click the high float to cut its wire.</p>
+   </div>
+  </div>
+ </div>
+ <div id="tip" role="tooltip"></div>
+
+ <section id="how">
+  <div class="wrap">
+   <h2>From a sentence to a <span class="grad">tested design</span></h2>
+   <div class="cards">
+    <div class="tilt"><span class="n grad">01</span><h3>Describe it</h3><p>Say what you need in everyday language. CircuitPilot turns it into parts and connections you can edit.</p><div class="sample">“A tank that refills from a well when the water gets low and stops when it’s full.”</div></div>
+    <div class="tilt"><span class="n grad">02</span><h3>Simulate it</h3><p>Run the design and watch levels, flows and switching change over time. Break a part and see what happens next.</p></div>
+    <div class="tilt"><span class="n grad">03</span><h3>Validate it</h3><p>Checks run on every change and name the part behind each problem, so you fix the design instead of the hardware.</p></div>
+   </div>
+  </div>
+ </section>
+
+ <section id="catches" style="padding-top:1rem">
+  <div class="wrap">
+   <h2>Catch mistakes while they’re <span class="grad">still free to fix</span></h2>
+   <div class="lab">
+    <div role="tablist" aria-label="Design problems" id="tabs"></div>
+    <div role="tabpanel" id="panel" aria-live="polite"></div>
+   </div>
+  </div>
+ </section>
+
+ <section id="waitlist" style="padding-block:1rem 0">
+  <div class="wrap">
+   <div class="band">
+    <h2>Try CircuitPilot early</h2>
+    <p>CircuitPilot is in early development. Leave your email and we’ll write when the first prototype opens.</p>
+    <form id="wl" novalidate>
+     <label for="email" hidden>Email address</label>
+     <input id="email" type="email" placeholder="you@example.com" autocomplete="email" required>
+     <button class="btn" type="submit">Join the waitlist</button>
+    </form>
+    <p id="fmsg" aria-live="polite"></p>
+   </div>
+  </div>
+ </section>
+</main>
+<footer><div class="wrap">CircuitPilot. AI-assisted design for physical systems.</div></footer>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script>
+(function(){
+var $=function(s){return document.querySelector(s)},$$=function(s){return [].slice.call(document.querySelectorAll(s))};
+var reduce=matchMedia("(prefers-reduced-motion: reduce)").matches,de=document.documentElement;
+
+addEventListener("pointermove",function(e){de.style.setProperty("--mx",e.clientX+"px");de.style.setProperty("--my",e.clientY+"px")});
+$$(".tilt").forEach(function(c){
+ c.addEventListener("pointermove",function(e){if(reduce)return;var r=c.getBoundingClientRect(),x=(e.clientX-r.left)/r.width,y=(e.clientY-r.top)/r.height;
+  c.style.transform="rotateX("+((.5-y)*16)+"deg) rotateY("+((x-.5)*16)+"deg)";c.style.setProperty("--gx",x*100+"%");c.style.setProperty("--gy",y*100+"%")});
+ c.addEventListener("pointerleave",function(){c.style.transform=""});
+});
+
+var TABS=[["Missing stop signal","A pump or motor that nothing can switch off. Try it above: disconnect the high float and watch the tank overflow."],
+["Dry running","A pump that can run with nothing to move, which wears it out fast. CircuitPilot checks that every pump has a supply."],
+["Rapid cycling","Start and stop points so close together that a part switches on and off constantly."],
+["Conflicting commands","Two controls asking the same part to do opposite things at the same moment."],
+["Loose connections","A sensor or wire that leads nowhere, so the controller never hears from it."]];
+var tabs=$("#tabs"),panel=$("#panel");
+function pick(i){$$("[role=tab]").forEach(function(t,j){t.setAttribute("aria-selected",i===j)});panel.innerHTML="";var h=document.createElement("h3"),p=document.createElement("p");h.textContent=TABS[i][0];p.textContent=TABS[i][1];panel.appendChild(h);panel.appendChild(p)}
+TABS.forEach(function(t,i){var b=document.createElement("button");b.type="button";b.setAttribute("role","tab");b.textContent=t[0];b.addEventListener("click",function(){pick(i)});tabs.appendChild(b)});
+pick(0);
+
+/* simulation state */
+var LOW=.2,HIGH=.85,L=.45,pump=true,fault=false,state="ok",running=!reduce,bs=Infinity,gen=false;
+function step(dt){L+=((pump?.1:0)-(L>0?.04:0))*dt;L=Math.max(0,Math.min(1,L));if(L<=LOW)pump=true;else if(L>=HIGH&&!fault)pump=false}
+function setState(s){
+ state=s;var bad=s!=="ok";
+ $("#cst").textContent=bad?"Failing":"Passing";$("#chk").className="chip "+(bad?"bad":"ok");
+ var m=$("#msg");m.className=bad?"bad":"";
+ m.textContent=s==="ok"?"The pump starts at the low float and stops at the high float.":s==="fault"?"The high float is disconnected, so nothing tells the pump to stop. The tank will overflow.":"The tank is overflowing. With the high float disconnected, the pump never stops."}
+function toggleFault(){fault=!fault;if(fault)pump=true;var b=$("#fault");b.setAttribute("aria-pressed",fault);b.textContent=fault?"Reconnect high float":"Disconnect high float"}
+$("#fault").addEventListener("click",toggleFault);
+var rb=$("#run");function lab(){rb.textContent=running?"Pause simulation":"Run simulation"}
+rb.addEventListener("click",function(){running=!running;lab()});lab();
+var PROMPT="A tank that refills from a well when the water gets low, and stops when it’s full.",inp=$("#pr"),gb=$("#gen");
+function generate(){
+ if(gen)return;gen=true;gb.disabled=true;inp.value="";L=.45;pump=true;bs=Infinity;var i=0;
+ var iv=setInterval(function(){i+=reduce?99:1;inp.value=PROMPT.slice(0,i);
+  if(i>=PROMPT.length){clearInterval(iv);bs=performance.now();setTimeout(function(){gen=false;gb.disabled=false},reduce?0:3300)}},22);
+}
+gb.addEventListener("click",generate);setTimeout(generate,500);
+
+/* 3D scene */
+var G=null,canvas=$("#gl"),hero=$(".hero");
+if(window.THREE){try{
+ var T=THREE,BL=0x19b5ff,OR=0xff7a1a,renderer=new T.WebGLRenderer({canvas:canvas,antialias:true,alpha:true});
+ renderer.setPixelRatio(Math.min(devicePixelRatio,2));
+ var scene=new T.Scene(),cam=new T.PerspectiveCamera(45,1,.1,100),root=new T.Group();scene.add(root);
+ var mat=function(c,o,side){return new T.MeshBasicMaterial({color:c,transparent:true,opacity:o,side:side||T.FrontSide,depthWrite:false})};
+ var edges=function(g,c){var m=new T.LineBasicMaterial({color:c});return {m:m,l:new T.LineSegments(new T.EdgesGeometry(g),m)}};
+ var parts=[],part=function(name,desc,x,y,z,delay){var g=new T.Group();g.position.set(x,y,z);g.userData={name:name,desc:desc,base:new T.Vector3(x,y,z),delay:delay,hv:0};root.add(g);parts.push(g);return g};
+ var grid=new T.GridHelper(26,52,0x2d6bff,0x12306e);grid.position.y=-1.65;grid.material.transparent=true;grid.material.opacity=.45;root.add(grid);
+ /* tank */
+ var tank=part("Tank","Holds the water. The level rises when the pump runs and falls as water is used.",0,0,0,.2),tg=new T.CylinderGeometry(1.2,1.2,3,16);
+ tank.add(new T.Mesh(new T.CylinderGeometry(1.2,1.2,3,32,1,true),mat(BL,.1,T.DoubleSide)));
+ var te=edges(tg,BL);tank.add(te.l);
+ var water=new T.Mesh(new T.CylinderGeometry(1.14,1.14,1,32),mat(0x19d3ff,.55));tank.add(water);
+ /* floats */
+ var mkFloat=function(n,d,y,delay){var f=part(n,d,-1,y,0,delay),m=mat(BL,.9);f.add(new T.Mesh(new T.SphereGeometry(.14,16,12),m));var e=edges(new T.SphereGeometry(.17,8,6),0xffffff);f.add(e.l);return {g:f,m:m}};
+ var fH=mkFloat("High float","Tells the controller the tank is full so it can stop the pump. Click to cut its wire.",1.05,.6),fL=mkFloat("Low float","Tells the controller the tank is nearly empty so it can start the pump.",-.9,.8);
+ /* pump */
+ var pg=part("Pump","Moves water from the source into the tank whenever the controller switches it on.",-3.3,-1.2,0,1.0),pb=new T.CylinderGeometry(.5,.5,.7,20);
+ var pm=new T.Mesh(pb,mat(OR,.18));pm.rotation.z=Math.PI/2;pg.add(pm);var pe=edges(pb,OR);pe.l.rotation.z=Math.PI/2;pg.add(pe.l);
+ var rotor=new T.Mesh(new T.BoxGeometry(.14,.8,.1),mat(OR,.95));pg.add(rotor);
+ /* controller */
+ var cg=part("Controller","Reads both floats and decides when the pump runs.",-2.4,1.5,0,1.3),cb=new T.BoxGeometry(1.3,.8,.8);
+ cg.add(new T.Mesh(cb,mat(BL,.14)));cg.add(edges(cb,BL).l);
+ var led=new T.Mesh(new T.SphereGeometry(.07,10,8),mat(OR,1));led.position.set(.5,.2,.41);cg.add(led);
+ /* source */
+ var sg=part("Source","The well the pump draws water from.",-5.4,-1.3,0,.4),sb=new T.BoxGeometry(1.3,.6,1.2);
+ sg.add(new T.Mesh(sb,mat(BL,.22)));sg.add(edges(sb,BL).l);
+ /* pipes and wires */
+ var pipeMats=[],pipe=function(a,b){var m=mat(BL,.85);pipeMats.push(m);root.add(new T.Mesh(new T.TubeGeometry(new T.LineCurve3(new T.Vector3(a[0],a[1],0),new T.Vector3(b[0],b[1],0)),1,.07,8),m))};
+ pipe([-4.75,-1.2],[-3.8,-1.2]);pipe([-2.8,-1.2],[-1.2,-1.2]);
+ var wire=function(pts,c){var m=new T.LineBasicMaterial({color:c,transparent:true});root.add(new T.Line(new T.BufferGeometry().setFromPoints(pts.map(function(p){return new T.Vector3(p[0],p[1],0)})),m));return m};
+ var wH=wire([[-1.75,1.5],[-1,1.5],[-1,1.2]],OR);wire([[-2.4,1.1],[-2.4,-.9],[-.86,-.9]],OR);wire([[-3.05,1.5],[-3.3,1.5],[-3.3,-.7]],OR);
+ /* particles */
+ var N=260,pp=new Float32Array(N*3),pc=new Float32Array(N*3),cc=new T.Color();
+ for(var i=0;i<N;i++){pp[i*3]=(Math.random()-.5)*26;pp[i*3+1]=Math.random()*12-4;pp[i*3+2]=(Math.random()-.5)*16;cc.setHex(Math.random()<.3?OR:BL);pc[i*3]=cc.r;pc[i*3+1]=cc.g;pc[i*3+2]=cc.b}
+ var pgm=new T.BufferGeometry();pgm.setAttribute("position",new T.BufferAttribute(pp,3));pgm.setAttribute("color",new T.BufferAttribute(pc,3));
+ scene.add(new T.Points(pgm,new T.PointsMaterial({size:.06,vertexColors:true,transparent:true,opacity:.8})));
+ /* interaction */
+ var ry=-.45,rx=.28,mx=0,my=0,drag=null,moved=0,hover=null,ray=new T.Raycaster(),ndc=new T.Vector2(),tip=$("#tip"),info=$("#info");
+ var ancestor=function(o){while(o&&!(o.userData&&o.userData.name))o=o.parent;return o};
+ var pt=function(e){var r=canvas.getBoundingClientRect();ndc.set((e.clientX-r.left)/r.width*2-1,-((e.clientY-r.top)/r.height)*2+1)};
+ canvas.addEventListener("pointerdown",function(e){drag={x:e.clientX,y:e.clientY};moved=0;canvas.setPointerCapture(e.pointerId);canvas.style.cursor="grabbing"});
+ canvas.addEventListener("pointermove",function(e){
+  mx=e.clientX/innerWidth-.5;my=e.clientY/innerHeight-.5;
+  if(drag){var dx=e.clientX-drag.x,dy=e.clientY-drag.y;moved+=Math.abs(dx)+Math.abs(dy);ry+=dx*.008;rx=Math.max(-.1,Math.min(.7,rx+dy*.005));drag={x:e.clientX,y:e.clientY};tip.style.opacity=0;return}
+  pt(e);ray.setFromCamera(ndc,cam);var h=ray.intersectObjects(parts,true),p=h.length?ancestor(h[0].object):null;
+  hover=p;canvas.style.cursor=p?"pointer":"grab";
+  if(p){tip.innerHTML="";var b=document.createElement("b");b.textContent=p.userData.name;tip.appendChild(b);tip.appendChild(document.createTextNode(p.userData.desc));tip.style.left=Math.min(e.clientX+16,innerWidth-250)+"px";tip.style.top=e.clientY+16+"px";tip.style.opacity=1}else tip.style.opacity=0});
+ canvas.addEventListener("pointerup",function(e){drag=null;canvas.style.cursor=hover?"pointer":"grab";
+  if(moved<6&&hover){info.textContent=hover.userData.name+": "+hover.userData.desc;if(hover===fH.g)toggleFault()}});
+ canvas.addEventListener("pointerleave",function(){hover=null;tip.style.opacity=0});
+ var size=function(){var w=hero.clientWidth,h=hero.clientHeight,a=w/h;renderer.setSize(w,h,false);cam.aspect=a;cam.updateProjectionMatrix();
+  var wide=w>900;root.scale.setScalar(wide?1:Math.max(.42,w/760));root.position.set(wide?4.3:2.2*Math.max(.42,w/760),wide?-.2:-2.3,0);cam.position.set(0,2.4,wide?11:10.5)};
+ addEventListener("resize",size);size();
+ var vis=true;new IntersectionObserver(function(en){vis=en[0].isIntersecting}).observe(hero);
+ var ease=function(k){return 1-Math.pow(1-k,3)},tmp=new T.Color();
+ G={vis:function(){return vis},update:function(t,dt,now){
+  if(!drag&&!reduce)ry+=0;root.rotation.y=ry+(reduce?0:Math.sin(t*.35)*.12);root.rotation.x=rx;
+  cam.position.x+=(mx*1.6-cam.position.x)*.05;cam.position.y+=(2.4-my*1.2-cam.position.y)*.05;cam.lookAt(0,0,0);
+  var h=L*2.9;water.scale.y=Math.max(h,.001);water.position.y=-1.5+h/2;
+  var over=state==="over";te.m.color.setHex(over?OR:BL);
+  fH.m.color.setHex(fault?OR:(L>=HIGH?0xffffff:BL));fH.m.opacity=fault&&!reduce?.5+.5*Math.sin(t*10):.9;fL.m.color.setHex(L>=LOW?0xffffff:BL);
+  wH.opacity=fault?.25:1;
+  pipeMats.forEach(function(m){m.color.setHex(pump?OR:BL)});
+  rotor.rotation.x+=pump&&running?dt*9:0;led.material.color.setHex(pump?OR:0x2a3558);
+  parts.forEach(function(p){var u=p.userData,k=ease(Math.max(0,Math.min(1,(now-bs-u.delay*1000)/700)));u.hv+=((p===hover?1:0)-u.hv)*.2;
+   p.visible=k>0;p.scale.setScalar(Math.max(.001,k)*(1+u.hv*.08));p.position.set(u.base.x,u.base.y+(1-k)*3.5,u.base.z)});
+  var a=pgm.attributes.position.array;for(var i=0;i<N;i++){a[i*3+1]+=dt*.12;if(a[i*3+1]>8)a[i*3+1]=-4}pgm.attributes.position.needsUpdate=true;
+  renderer.render(scene,cam)}};
+}catch(err){G=null}}
+
+var last=performance.now();
+function frame(now){requestAnimationFrame(frame);var dt=Math.min((now-last)/1000,.1);last=now;
+ if(running)step(dt);
+ var s=!fault?"ok":(L>=.995?"over":"fault");if(s!==state)setState(s);
+ $("#lvl").textContent=Math.round(L*100)+"%";$("#pst").textContent=pump?"Running":"Off";
+ if(G&&G.vis())G.update(now/1000,dt,now)}
+requestAnimationFrame(frame);
+
+var form=$("#wl"),input=$("#email"),fm=$("#fmsg");
+form.addEventListener("submit",function(e){e.preventDefault();var v=input.value.trim();
+ if(!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(v)){input.setAttribute("aria-invalid","true");fm.className="bad";fm.textContent="Enter an email address like name@example.com.";input.focus();return}
+ input.removeAttribute("aria-invalid");fm.className="ok";fm.textContent="You’re on the list. We’ll write to "+v+" when the prototype opens.";form.reset()});
+})();
+</script>
+</body>
+</html>

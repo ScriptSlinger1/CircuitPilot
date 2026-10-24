@@ -1,0 +1,22 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Title</title>
+</head>
+<body>
+<form method="post">
+    {%csrf_token%}
+    <label for="question"></label>
+    <input id="question" name="question" type="text">
+    <button type="submit">Submit</button>
+</form>
+{%if question%}
+<h1>Your question: {{question}}</h1>
+{%if response%}
+<h2>Your response: {{response}}</h2>
+{%endif%}
+{%endif%}
+
+</body>
+</html>
