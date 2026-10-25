@@ -1,22 +1,615 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <title>Title</title>
-</head>
-<body>
-<form method="post">
-    {%csrf_token%}
-    <label for="question"></label>
-    <input id="question" name="question" type="text">
-    <button type="submit">Submit</button>
-</form>
-{%if question%}
-<h1>Your question: {{question}}</h1>
-{%if response%}
-<h2>Your response: {{response}}</h2>
-{%endif%}
-{%endif%}
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>CircuitPilot AI</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&family=Space+Grotesk:wght@400;500;700&display=swap" rel="stylesheet">
+<style>
+:root{
+  color-scheme:dark;
+  --bg:#05070d;--panel:rgba(12,17,31,.66);--border:rgba(90,140,255,.2);
+  --text:#eaf0ff;--muted:#8d9bb8;
+  --or:#ff7a1a;--or2:#ffb347;--bl:#2a8bff;--bl2:#66b3ff;
+  --glow-or:0 0 24px rgba(255,122,26,.45);--glow-bl:0 0 24px rgba(42,139,255,.4);
+  --mono:'JetBrains Mono',ui-monospace,monospace;
+}
+*{box-sizing:border-box}
+html{scroll-behavior:smooth}
+body{margin:0;min-height:100vh;background:var(--bg);color:var(--text);font-family:'Space Grotesk',Inter,system-ui,sans-serif;overflow-x:hidden}
+button,input,textarea{font:inherit}
+button{cursor:pointer}
+button:disabled{opacity:.3;cursor:not-allowed}
 
+/* animated backdrop */
+.aurora{position:fixed;inset:0;z-index:-2;overflow:hidden;
+  background:radial-gradient(60% 50% at 12% 0%,rgba(255,122,26,.22),transparent 70%),radial-gradient(55% 55% at 92% 8%,rgba(42,139,255,.25),transparent 70%)}
+.aurora::before{content:"";position:absolute;inset:-50%;
+  background:radial-gradient(circle at 30% 70%,rgba(42,139,255,.12),transparent 35%),radial-gradient(circle at 75% 30%,rgba(255,122,26,.1),transparent 35%);
+  animation:drift 22s ease-in-out infinite alternate}
+.aurora::after{content:"";position:absolute;inset:0;
+  background-image:linear-gradient(rgba(90,140,255,.07) 1px,transparent 1px),linear-gradient(90deg,rgba(90,140,255,.07) 1px,transparent 1px);
+  background-size:56px 56px;
+  -webkit-mask-image:radial-gradient(ellipse at 50% 20%,#000 20%,transparent 75%);mask-image:radial-gradient(ellipse at 50% 20%,#000 20%,transparent 75%)}
+@keyframes drift{to{transform:translate(6%,-5%) rotate(8deg)}}
+
+.topbar{position:sticky;top:0;z-index:20;height:68px;padding:0 5%;display:flex;align-items:center;justify-content:space-between;
+  border-bottom:1px solid var(--border);background:rgba(5,7,13,.62);-webkit-backdrop-filter:blur(14px);backdrop-filter:blur(14px)}
+.brand{font-weight:700;font-size:21px;letter-spacing:-.6px}
+.brand span{color:var(--or);text-shadow:var(--glow-or)}
+.top-label{display:flex;align-items:center;gap:9px;font:600 11px var(--mono);letter-spacing:.14em;color:var(--bl2)}
+.top-label i{width:8px;height:8px;border-radius:50%;background:#3ddc97;box-shadow:0 0 10px #3ddc97;animation:pulse 1.6s infinite}
+@keyframes pulse{50%{opacity:.3;transform:scale(.7)}}
+
+main{width:min(1450px,94%);margin:42px auto 70px}
+.intro{margin-bottom:34px;animation:rise .8s both}
+@keyframes rise{from{opacity:0;transform:translateY(16px)}}
+.eyebrow{display:inline-flex;align-items:center;gap:12px;color:var(--or);font:600 11px var(--mono);letter-spacing:.24em;text-transform:uppercase}
+.eyebrow::before{content:"";width:36px;height:1px;background:linear-gradient(90deg,transparent,var(--or));box-shadow:var(--glow-or)}
+h1{font-size:clamp(34px,5.4vw,66px);line-height:1.02;letter-spacing:-.04em;margin:14px 0;font-weight:700;
+  background:linear-gradient(100deg,#fff 0%,var(--or2) 28%,var(--or) 45%,var(--bl) 75%,var(--bl2) 100%);background-size:220% 100%;
+  -webkit-background-clip:text;background-clip:text;color:transparent;animation:shine 7s linear infinite alternate}
+@keyframes shine{to{background-position:100% 0}}
+.subtitle{color:var(--muted);line-height:1.7;max-width:660px;margin:0;font-size:16px}
+
+.generator{display:grid;grid-template-columns:minmax(280px,.8fr) minmax(0,1.5fr);gap:20px;align-items:stretch;animation:rise .9s .15s both}
+.panel,.details{position:relative;border:1px solid var(--border);background:var(--panel);border-radius:18px;overflow:hidden;min-width:0;
+  -webkit-backdrop-filter:blur(16px);backdrop-filter:blur(16px);box-shadow:0 20px 60px rgba(0,0,0,.45),inset 0 1px 0 rgba(255,255,255,.05);transition:border-color .3s,box-shadow .3s}
+.panel:hover,.details:hover{border-color:rgba(255,122,26,.4);box-shadow:0 20px 60px rgba(0,0,0,.45),0 0 40px rgba(42,139,255,.12)}
+.panel::before,.details::before{content:"";position:absolute;inset:0;pointer-events:none;
+  background:radial-gradient(420px circle at var(--mx,50%) var(--my,0%),rgba(255,122,26,.13),transparent 45%)}
+.panel>*,.details>*{position:relative}
+.panel-inner{padding:24px}
+h2{font-size:15px;margin:0 0 8px;letter-spacing:.02em}
+.muted{color:var(--muted);font-size:13px;line-height:1.65}
+label{display:block;margin:22px 0 9px;font:600 11px var(--mono);letter-spacing:.14em;text-transform:uppercase;color:var(--bl2)}
+textarea{width:100%;min-height:160px;resize:vertical;padding:14px;background:rgba(4,7,14,.8);border:1px solid var(--border);border-radius:12px;color:var(--text);outline:none;line-height:1.6;transition:border-color .2s,box-shadow .2s}
+textarea:focus{border-color:var(--or);box-shadow:0 0 0 3px rgba(255,122,26,.16),var(--glow-or)}
+textarea::placeholder{color:#56627c}
+
+.primary,.secondary{border-radius:10px;padding:11px 15px;border:1px solid var(--border);color:var(--text);background:rgba(20,30,52,.7);transition:all .2s}
+.primary{width:100%;margin-top:14px;border:0;font-weight:700;color:#150800;letter-spacing:.01em;position:relative;overflow:hidden;
+  background:linear-gradient(100deg,var(--or),var(--or2));box-shadow:var(--glow-or)}
+.primary::after{content:"";position:absolute;top:0;bottom:0;left:-60%;width:40%;background:linear-gradient(100deg,transparent,rgba(255,255,255,.55),transparent);transform:skewX(-20deg);transition:left .6s}
+.primary:hover{transform:translateY(-2px);box-shadow:0 0 36px rgba(255,122,26,.7)}
+.primary:hover::after{left:130%}
+.primary.loading{pointer-events:none;background:linear-gradient(100deg,var(--bl),var(--bl2));color:#03101f;animation:pulse2 1s infinite alternate}
+@keyframes pulse2{to{box-shadow:0 0 40px rgba(42,139,255,.8)}}
+.secondary:hover:not(:disabled){border-color:var(--bl);color:var(--bl2);box-shadow:var(--glow-bl)}
+
+.error{margin-top:14px;padding:12px;border:1px solid rgba(255,90,100,.5);background:rgba(255,60,80,.08);border-radius:10px;color:#ffb7c0;font-size:13px;line-height:1.5}
+
+.viewer-header{padding:16px 20px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center;gap:12px}
+.viewer-header h2{margin:0;font-size:16px}
+.status{font:600 10.5px var(--mono);letter-spacing:.12em;color:var(--bl2);border:1px solid rgba(42,139,255,.5);background:rgba(42,139,255,.1);padding:6px 11px;border-radius:20px;white-space:nowrap;box-shadow:inset 0 0 12px rgba(42,139,255,.15)}
+.viewer{height:500px;min-height:300px;position:relative;background:radial-gradient(ellipse at 50% 45%,rgba(38,60,110,.55) 0%,rgba(6,9,18,.95) 72%)}
+.viewer::before,.viewer::after{content:"";position:absolute;width:30px;height:30px;z-index:3;pointer-events:none;border:2px solid var(--or);filter:drop-shadow(0 0 6px var(--or))}
+.viewer::before{top:14px;left:14px;border-right:0;border-bottom:0}
+.viewer::after{bottom:14px;right:14px;border-left:0;border-top:0;border-color:var(--bl);filter:drop-shadow(0 0 6px var(--bl))}
+#three-container{position:absolute;inset:0}
+#three-container canvas{display:block;width:100%;height:100%}
+#three-container::after{content:"";position:absolute;inset:0;pointer-events:none;background:repeating-linear-gradient(0deg,rgba(255,255,255,.025) 0 1px,transparent 1px 3px)}
+.viewer-empty{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;text-align:center;padding:30px;pointer-events:none;z-index:2}
+.viewer-empty strong{display:block;font-size:19px;margin-bottom:8px;color:var(--or2);text-shadow:var(--glow-or)}
+.viewer-empty p{color:var(--muted);font-size:13px;line-height:1.6;max-width:300px;margin:0 auto}
+
+.viewer-footer{display:flex;align-items:center;flex-wrap:wrap;gap:8px;padding:14px;border-top:1px solid var(--border)}
+.viewer-footer .spacer{flex:1}
+.step-info{padding:20px;border-top:1px solid var(--border)}
+.step-info h3{margin:0 0 8px;font-size:18px;color:var(--or2)}
+.step-info p{color:var(--muted);font-size:13.5px;line-height:1.7;margin:0}
+.step-number{color:var(--bl2);font:600 11px var(--mono);letter-spacing:.14em;margin-top:12px;text-transform:uppercase}
+.step-track{display:flex;gap:6px;padding:0 20px 20px}
+.step-dot{flex:1;height:5px;border-radius:5px;background:rgba(120,140,190,.2);transition:all .4s}
+.step-dot.done{background:linear-gradient(90deg,var(--or),var(--bl));box-shadow:0 0 12px rgba(255,122,26,.6)}
+
+.details{margin-top:20px;padding:26px;animation:rise .9s .3s both}
+.component-list{display:flex;flex-wrap:wrap;gap:9px;margin-top:14px;counter-reset:c}
+.component-chip{counter-increment:c;border:1px solid var(--border);background:rgba(8,12,22,.8);padding:9px 12px;border-radius:9px;font:12px var(--mono);color:#cbd6ee;cursor:pointer;transition:all .2s}
+.component-chip::before{content:counter(c,decimal-leading-zero);color:var(--or);margin-right:9px;font-weight:600}
+.component-chip:hover{border-color:var(--or);color:#fff;box-shadow:var(--glow-or);transform:translateY(-2px)}
+.warning-list{padding-left:20px;color:var(--muted);font-size:13px;line-height:1.85}
+.warning-list li::marker{color:var(--or)}
+
+@media(max-width:850px){.generator{grid-template-columns:1fr}.viewer{height:410px}}
+@media(max-width:480px){main{width:92%;margin-top:26px}.topbar{padding:0 4%}.top-label span{display:none}.viewer{height:350px}.viewer-footer button{padding:9px 10px;font-size:12px}}
+@media(prefers-reduced-motion:reduce){*,*::before,*::after{animation:none!important;transition:none!important}}
+</style>
+</head>
+
+<body>
+<div class="aurora"></div>
+
+<header class="topbar">
+    <div class="brand">Circuit<span>Pilot</span></div>
+    <div class="top-label"><i></i><span>AI ENGINEERING LAB · SYSTEM ONLINE</span></div>
+</header>
+
+<main>
+    <section class="intro">
+        <div class="eyebrow">From idea to assembly</div>
+        <h1>Build it before<br>you build it.</h1>
+        <p class="subtitle">
+            Describe a physical device. CircuitPilot creates a conceptual
+            component plan and visualizes its assembly in an interactive
+            3D environment.
+        </p>
+    </section>
+
+    <section class="generator">
+        <div class="panel">
+            <div class="panel-inner">
+                <h2>Describe your device</h2>
+                <p class="muted">
+                    Explain what it does and, if you know them, its
+                    main components, dimensions, and materials.
+                </p>
+
+                <form method="POST" id="gen-form">
+                    {% csrf_token %}
+
+                    <label for="question">What do you want to build?</label>
+
+                    <textarea
+                            id="question"
+                            name="question"
+                            maxlength="5000"
+                            required
+                            placeholder="Example: Create a traffic light with a pole, a three-light housing, red/yellow/green lenses, and a mounting base."
+                    >{{ question|default:"" }}</textarea>
+
+                    <button class="primary" type="submit" id="gen-btn">
+                        Generate 3D assembly plan →
+                    </button>
+                </form>
+
+                {% if error %}
+                <div class="error">{{ error }}</div>
+                {% endif %}
+
+                <div style="margin-top: 20px;">
+                    <p class="muted">
+                        Tip: start with a simple object such as a desk fan,
+                        traffic light, robotic gripper, or Arduino sensor.
+                        Complex designs may be simplified.
+                    </p>
+                </div>
+            </div>
+        </div>
+
+        <div class="panel">
+            <div class="viewer-header">
+                <h2 id="device-title">
+                    {% if assembly_plan %}
+                    {{ assembly_plan.title }}
+                    {% else %}
+                    3D Assembly Viewer
+                    {% endif %}
+                </h2>
+
+                <span class="status" id="viewer-status">
+                    {% if assembly_plan %}READY{% else %}AWAITING DEVICE{% endif %}
+                </span>
+            </div>
+
+            <div class="viewer">
+                <div id="three-container"></div>
+
+                <div class="viewer-empty" id="viewer-empty"
+                     {% if assembly_plan %}style="display:none" {% endif %}>
+                    <div>
+                        <strong>Your 3D workspace</strong>
+                        <p>
+                            Submit a device description to generate its
+                            component model and step-by-step assembly.
+                        </p>
+                    </div>
+                </div>
+            </div>
+
+            <div class="viewer-footer">
+                <button class="secondary" id="previous-btn" disabled>← Previous</button>
+                <button class="secondary" id="next-btn" disabled>Next →</button>
+                <span class="spacer"></span>
+                <button class="secondary" id="play-btn" disabled>▶ Play</button>
+                <button class="secondary" id="pause-btn" disabled>Ⅱ Pause</button>
+                <button class="secondary" id="reset-btn" disabled>↺ Reset</button>
+            </div>
+
+            <div class="step-info">
+                <h3 id="step-title">Waiting for assembly plan</h3>
+                <p id="step-description">Your assembly instructions will appear here.</p>
+                <div class="step-number" id="step-counter">Step 0 of 0</div>
+            </div>
+
+            <div class="step-track" id="step-track"></div>
+        </div>
+    </section>
+
+    {% if assembly_plan %}
+    {{ assembly_plan|json_script:"assembly-plan-data" }}
+
+    <section class="details">
+        <h2>Device overview</h2>
+        <p class="muted" id="device-description">
+            {{ assembly_plan.description }}
+        </p>
+
+        <h2 style="margin-top: 24px;">Components <span class="muted">· click one to highlight it in 3D</span></h2>
+        <div class="component-list" id="component-list"></div>
+
+        {% if assembly_plan.assumptions %}
+        <h2 style="margin-top: 24px;">Assumptions</h2>
+        <ul class="warning-list">
+            {% for item in assembly_plan.assumptions %}
+            <li>{{ item }}</li>
+            {% endfor %}
+        </ul>
+        {% endif %}
+
+        {% if assembly_plan.validation_warnings %}
+        <h2 style="margin-top: 24px;">Engineering warnings</h2>
+        <ul class="warning-list">
+            {% for item in assembly_plan.validation_warnings %}
+            <li>{{ item }}</li>
+            {% endfor %}
+        </ul>
+        {% endif %}
+
+        {% if assembly_plan.limitations %}
+        <h2 style="margin-top: 24px;">Model limitations</h2>
+        <ul class="warning-list">
+            {% for item in assembly_plan.limitations %}
+            <li>{{ item }}</li>
+            {% endfor %}
+        </ul>
+        {% endif %}
+    </section>
+    {% endif %}
+</main>
+
+<script>
+document.querySelectorAll(".panel,.details").forEach(function (p) {
+    p.addEventListener("pointermove", function (e) {
+        var r = p.getBoundingClientRect();
+        p.style.setProperty("--mx", (e.clientX - r.left) + "px");
+        p.style.setProperty("--my", (e.clientY - r.top) + "px");
+    });
+});
+document.getElementById("gen-form").addEventListener("submit", function () {
+    var b = document.getElementById("gen-btn");
+    b.classList.add("loading");
+    b.textContent = "Engineering your device…";
+});
+</script>
+
+{% if assembly_plan %}
+{# The import map must come BEFORE the module script that uses it. #}
+<script type="importmap">
+{
+    "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.180.0/build/three.module.js",
+        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.180.0/examples/jsm/"
+    }
+}
+</script>
+
+<script type="module">
+    import * as THREE from "three";
+    import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+
+    const plan = JSON.parse(document.getElementById("assembly-plan-data").textContent);
+    const $ = id => document.getElementById(id);
+
+    const container = $("three-container"), statusEl = $("viewer-status"), emptyEl = $("viewer-empty");
+    const previousBtn = $("previous-btn"), nextBtn = $("next-btn"), playBtn = $("play-btn"),
+          pauseBtn = $("pause-btn"), resetBtn = $("reset-btn");
+    const stepTitle = $("step-title"), stepDescription = $("step-description"),
+          stepCounter = $("step-counter"), stepTrack = $("step-track"), componentList = $("component-list");
+
+    const scene = new THREE.Scene();
+
+    const camera = new THREE.PerspectiveCamera(45, container.clientWidth / container.clientHeight, 0.01, 1000);
+    camera.position.set(...plan.camera.position);
+
+    // Transparent canvas so the page's glow shows through.
+    const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+    renderer.setClearColor(0x000000, 0);
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    renderer.setSize(container.clientWidth, container.clientHeight);
+    renderer.outputColorSpace = THREE.SRGBColorSpace;
+    container.appendChild(renderer.domElement);
+
+    const controls = new OrbitControls(camera, renderer.domElement);
+    controls.target.set(...plan.camera.target);
+    controls.enableDamping = true;
+    controls.dampingFactor = 0.07;
+    controls.minDistance = 0.2;
+    controls.maxDistance = 30;
+    controls.autoRotate = true;          // slow showcase spin until the user grabs the model
+    controls.autoRotateSpeed = 0.9;
+    controls.addEventListener("start", () => { controls.autoRotate = false; });
+    controls.update();
+
+    // Neon lighting: orange and blue rim lights
+    scene.add(new THREE.HemisphereLight(0xcbdcff, 0x202432, 1.6));
+    const keyLight = new THREE.DirectionalLight(0xffffff, 2.6);
+    keyLight.position.set(4, 7, 5);
+    scene.add(keyLight);
+    const orangeLight = new THREE.PointLight(0xff7a1a, 14, 0, 2);
+    orangeLight.position.set(-3, 2.5, 2.5);
+    scene.add(orangeLight);
+    const blueLight = new THREE.PointLight(0x2a8bff, 14, 0, 2);
+    blueLight.position.set(3, 2, -3);
+    scene.add(blueLight);
+
+    // Glowing floor grid (orange centre lines, blue grid)
+    const grid = new THREE.GridHelper(10, 40, 0xff7a1a, 0x1c3d78);
+    grid.material.transparent = true;
+    grid.material.opacity = 0.55;
+    scene.add(grid);
+
+    // Floating dust particles
+    const dustCount = 280, dustPos = new Float32Array(dustCount * 3);
+    for (let i = 0; i < dustCount; i++) {
+        dustPos[i * 3] = (Math.random() - 0.5) * 14;
+        dustPos[i * 3 + 1] = Math.random() * 6;
+        dustPos[i * 3 + 2] = (Math.random() - 0.5) * 14;
+    }
+    const dustGeo = new THREE.BufferGeometry();
+    dustGeo.setAttribute("position", new THREE.BufferAttribute(dustPos, 3));
+    const dust = new THREE.Points(dustGeo, new THREE.PointsMaterial({
+        color: 0xff9a4d, size: 0.03, transparent: true, opacity: 0.75, depthWrite: false
+    }));
+    scene.add(dust);
+
+    const meshes = new Map();
+    let currentStep = 0, busy = false, playing = false, animationToken = 0;
+
+    function createGeometry(component) {
+        const [a, b, c] = component.dimensions;
+
+        switch (component.geometry) {
+            case "box": return new THREE.BoxGeometry(a, b, c);
+            case "cylinder": return new THREE.CylinderGeometry(a, c, b, 32);
+            case "sphere": return new THREE.SphereGeometry(a, 24, 16);
+            case "cone": return new THREE.ConeGeometry(a, b, 32);
+            case "torus": {
+                const geometry = new THREE.TorusGeometry(a, b, 16, 32);
+                // The AI schema defines toruses in the XZ plane; Three.js uses XY.
+                geometry.rotateX(-Math.PI / 2);
+                return geometry;
+            }
+            default:
+                throw new Error(`Unsupported geometry: ${component.geometry}`);
+        }
+    }
+
+    function createComponentMesh(component) {
+        const material = new THREE.MeshStandardMaterial({
+            color: component.color,
+            roughness: 0.45,
+            metalness: component.material === "metalness" ? 0.65 : 0.12,
+            transparent: component.opacity < 1,
+            opacity: component.opacity,
+            side: THREE.DoubleSide
+        });
+
+        const mesh = new THREE.Mesh(createGeometry(component), material);
+        mesh.position.set(...component.position);
+        mesh.rotation.set(...component.rotation);
+        mesh.visible = false;
+        mesh.userData.component = component;
+
+        // Holographic blue outline
+        mesh.add(new THREE.LineSegments(
+            new THREE.EdgesGeometry(mesh.geometry, 25),
+            new THREE.LineBasicMaterial({ color: 0x66b3ff, transparent: true, opacity: 0.55 })
+        ));
+
+        scene.add(mesh);
+        meshes.set(component.id, mesh);
+    }
+
+    for (const component of plan.components) createComponentMesh(component);
+
+    // Component chips: click to flash the part in 3D
+    for (const component of plan.components) {
+        const chip = document.createElement("span");
+        chip.className = "component-chip";
+        chip.textContent = component.name;
+        chip.addEventListener("click", () => {
+            const mesh = meshes.get(component.id);
+            if (!mesh || !mesh.visible) return;
+            controls.autoRotate = false;
+            mesh.material.emissive.set(0xff7a1a);
+            mesh.material.emissiveIntensity = 1.4;
+            setTimeout(() => { mesh.material.emissive.set(0x000000); mesh.material.emissiveIntensity = 0; }, 900);
+        });
+        componentList.appendChild(chip);
+    }
+
+    for (const step of plan.assembly_steps) {
+        const dot = document.createElement("div");
+        dot.className = "step-dot";
+        dot.title = `Step ${step.step}: ${step.title}`;
+        stepTrack.appendChild(dot);
+    }
+    const dots = [...stepTrack.children];
+
+    function setMaterialOpacity(mesh, opacity) {
+        mesh.material.opacity = opacity;
+        mesh.material.transparent = opacity < 1;
+        mesh.material.needsUpdate = true;
+    }
+
+    function setFinalTransform(component) {
+        const mesh = meshes.get(component.id);
+        mesh.position.set(...component.position);
+        mesh.rotation.set(...component.rotation);
+        mesh.scale.set(1, 1, 1);
+        mesh.material.emissiveIntensity = 0;
+        setMaterialOpacity(mesh, component.opacity);
+    }
+
+    function updateUI() {
+        const total = plan.assembly_steps.length;
+        stepCounter.textContent = `Step ${currentStep} of ${total}`;
+
+        previousBtn.disabled = busy || currentStep === 0;
+        nextBtn.disabled = busy || currentStep >= total;
+        playBtn.disabled = busy || playing || currentStep >= total;
+        pauseBtn.disabled = !playing;
+        resetBtn.disabled = busy || (currentStep === 0 && !playing);
+
+        dots.forEach((dot, index) => dot.classList.toggle("done", index < currentStep));
+
+        if (currentStep === 0) {
+            stepTitle.textContent = "Ready to assemble";
+            stepDescription.textContent = "Press Play to run the assembly or Next to move one step at a time.";
+        } else {
+            const completed = plan.assembly_steps[currentStep - 1];
+            stepTitle.textContent = completed.title;
+            stepDescription.textContent = completed.description;
+        }
+
+        statusEl.textContent = busy ? "ANIMATING" : playing ? "PLAYING"
+            : currentStep === total ? "ASSEMBLY COMPLETE" : "READY";
+    }
+
+    function setStepInstant(targetStep) {
+        currentStep = targetStep;
+        for (const component of plan.components) {
+            meshes.get(component.id).visible = component.assembly_step <= targetStep;
+            setFinalTransform(component);
+        }
+        updateUI();
+    }
+
+    const easeInOut = t => t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
+    const lerp = (a, b, t) => a + (b - a) * t;
+    const lerpVector = (from, to, t) => from.map((value, index) => lerp(value, to[index], t));
+    const isVec = v => Array.isArray(v) && v.length === 3 && v.every(Number.isFinite);
+    const waitForFrame = () => new Promise(resolve => requestAnimationFrame(resolve));
+
+    async function animateStep(step) {
+        const localToken = ++animationToken;
+        busy = true;
+        updateUI();
+
+        const hints = new Map((step.animations || []).map(a => [a.component_id, a]));
+        const startTime = performance.now();
+        const active = [];
+
+        step.component_ids.forEach((id, index) => {
+            const component = plan.components.find(c => c.id === id);
+            const mesh = meshes.get(id);
+            if (!component || !mesh) return;
+
+            const hint = hints.get(id) || {};
+            const fade = hint.type === "fade_in";
+            const to = component.position, toRot = component.rotation;   // always end at the real final transform
+            let from = isVec(hint.from_position) ? hint.from_position : to;
+            if (!fade && from.every((v, i) => v === to[i])) {
+                from = [to[0], to[1] + 0.35, to[2]];                     // default: drop in from above
+            }
+
+            mesh.material.emissive.set(0xff7a1a);
+            active.push({
+                component, mesh, fade, from, to, toRot,
+                fromRot: isVec(hint.from_rotation) ? hint.from_rotation : toRot,
+                duration: hint.duration_ms || 700,
+                start: startTime + index * 160                           // stagger parts within a step
+            });
+        });
+
+        const total = Math.max(0, ...active.map(a => a.start - startTime + a.duration));
+
+        while (performance.now() - startTime < total) {
+            if (localToken !== animationToken) { busy = false; return; }
+            const now = performance.now();
+
+            for (const a of active) {
+                if (now < a.start) continue;
+                a.mesh.visible = true;
+                const raw = Math.min(1, (now - a.start) / a.duration);
+                const t = easeInOut(raw);
+                a.mesh.position.set(...lerpVector(a.from, a.to, t));
+                a.mesh.rotation.set(...lerpVector(a.fromRot, a.toRot, t));
+                if (a.fade) setMaterialOpacity(a.mesh, a.component.opacity * raw);
+                a.mesh.material.emissiveIntensity = 1.4 * (1 - raw);
+            }
+            await waitForFrame();
+        }
+
+        active.forEach(a => setFinalTransform(a.component));
+        currentStep = step.step;
+        busy = false;
+        updateUI();
+    }
+
+    async function nextStep() {
+        if (busy || currentStep >= plan.assembly_steps.length) return;
+        await animateStep(plan.assembly_steps[currentStep]);
+    }
+
+    async function playAssembly() {
+        if (busy || playing) return;
+        playing = true;
+        updateUI();
+
+        while (playing && currentStep < plan.assembly_steps.length) {
+            await nextStep();
+            if (playing && currentStep < plan.assembly_steps.length) {
+                await new Promise(resolve => setTimeout(resolve, 250));
+            }
+        }
+
+        playing = false;
+        updateUI();
+    }
+
+    function pauseAssembly() { playing = false; updateUI(); }
+
+    function resetAssembly() {
+        if (busy) return;
+        playing = false;
+        animationToken++;
+        setStepInstant(0);
+    }
+
+    previousBtn.addEventListener("click", () => {
+        if (busy) return;
+        playing = false;
+        setStepInstant(Math.max(0, currentStep - 1));
+    });
+    nextBtn.addEventListener("click", nextStep);
+    playBtn.addEventListener("click", playAssembly);
+    pauseBtn.addEventListener("click", pauseAssembly);
+    resetBtn.addEventListener("click", resetAssembly);
+
+    // Keep the viewer correctly sized when the layout changes.
+    new ResizeObserver(() => {
+        const width = container.clientWidth, height = container.clientHeight;
+        if (!width || !height) return;
+        camera.aspect = width / height;
+        camera.updateProjectionMatrix();
+        renderer.setSize(width, height);
+    }).observe(container);
+
+    function render() {
+        requestAnimationFrame(render);
+        dust.rotation.y += 0.0007;
+        controls.update();
+        renderer.render(scene, camera);
+    }
+
+    setStepInstant(0);
+    emptyEl.style.display = "none";
+    render();
+</script>
+{% endif %}
 </body>
 </html>
