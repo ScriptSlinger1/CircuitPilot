@@ -216,6 +216,7 @@ textarea::placeholder{color:#56627c}
                 <button class="secondary" id="play-btn" disabled>▶ Play</button>
                 <button class="secondary" id="pause-btn" disabled>Ⅱ Pause</button>
                 <button class="secondary" id="reset-btn" disabled>↺ Reset</button>
+                <button class="secondary" id="fit-btn" disabled title="Re-centre the camera on the whole device">⌖ Fit view</button>
             </div>
 
             <div class="step-info">
@@ -287,6 +288,8 @@ document.getElementById("gen-form").addEventListener("submit", function () {
 
 {% if assembly_plan %}
 {# The import map must come BEFORE the module script that uses it. #}
+{# It is kept on purpose: OrbitControls.js and RoomEnvironment.js (loaded from jsDelivr) import "three" internally, #}
+{# and this map points that name at the same Three.js file imported by the module below, so only one copy loads. #}
 <script type="importmap">
 {
     "imports": {
@@ -297,318 +300,1287 @@ document.getElementById("gen-form").addEventListener("submit", function () {
 </script>
 
 <script type="module">
-    import * as THREE from "three";
-    import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+import * as THREE from "https://cdn.jsdelivr.net/npm/three@0.180.0/build/three.module.js";
+import { OrbitControls } from "https://cdn.jsdelivr.net/npm/three@0.180.0/examples/jsm/controls/OrbitControls.js";
 
-    const plan = JSON.parse(document.getElementById("assembly-plan-data").textContent);
-    const $ = id => document.getElementById(id);
+// ===========================================================================
+// 3D COMPONENT LIBRARY
+//
+// Every create*() function receives one plan component and returns a
+// THREE.Group centred on the origin.  For every type except "generic" the
+// plan's `dimensions` are the part's overall bounding box [x, y, z] in metres
+// (full extents, not radii).  The AI-generated position / rotation are applied
+// to the returned root by the caller, never to the child meshes.
+// ===========================================================================
 
-    const container = $("three-container"), statusEl = $("viewer-status"), emptyEl = $("viewer-empty");
-    const previousBtn = $("previous-btn"), nextBtn = $("next-btn"), playBtn = $("play-btn"),
-          pauseBtn = $("pause-btn"), resetBtn = $("reset-btn");
-    const stepTitle = $("step-title"), stepDescription = $("step-description"),
-          stepCounter = $("step-counter"), stepTrack = $("step-track"), componentList = $("component-list");
+const TAU = Math.PI * 2;
+const HALF_PI = Math.PI / 2;
+const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
+const lerp = (a, b, t) => a + (b - a) * t;
 
-    const scene = new THREE.Scene();
+/* ------------------------------ materials ------------------------------ */
 
-    const camera = new THREE.PerspectiveCamera(45, container.clientWidth / container.clientHeight, 0.01, 1000);
-    camera.position.set(...plan.camera.position);
+function mat(color, options = {}) {
+    return new THREE.MeshStandardMaterial({ color, roughness: 0.55, metalness: 0.0, ...options });
+}
+function metal(color, options = {}) {
+    return mat(color, { roughness: 0.3, metalness: 0.9, ...options });
+}
+function gloss(color, options = {}) {
+    return new THREE.MeshPhysicalMaterial({
+        color, roughness: 0.45, metalness: 0.0, clearcoat: 0.4, clearcoatRoughness: 0.3, ...options
+    });
+}
+// Thin overlays (copper, silkscreen) that lie on a surface: pull them toward the camera to avoid z-fighting.
+function flat(color, options = {}) {
+    return mat(color, { polygonOffset: true, polygonOffsetFactor: -2, polygonOffsetUnits: -2, ...options });
+}
 
-    // Transparent canvas so the page's glow shows through.
-    const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
-    renderer.setClearColor(0x000000, 0);
-    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
-    renderer.setSize(container.clientWidth, container.clientHeight);
-    renderer.outputColorSpace = THREE.SRGBColorSpace;
-    container.appendChild(renderer.domElement);
+/* ------------------------------- helpers ------------------------------- */
 
-    const controls = new OrbitControls(camera, renderer.domElement);
-    controls.target.set(...plan.camera.target);
-    controls.enableDamping = true;
-    controls.dampingFactor = 0.07;
-    controls.minDistance = 0.2;
-    controls.maxDistance = 30;
-    controls.autoRotate = true;          // slow showcase spin until the user grabs the model
-    controls.autoRotateSpeed = 0.9;
-    controls.addEventListener("start", () => { controls.autoRotate = false; });
-    controls.update();
+const UNIT_BOX = new THREE.BoxGeometry(1, 1, 1);
+const UNIT_CYLINDER = new THREE.CylinderGeometry(1, 1, 1, 16);
+const HEX_COLOR = /^#[0-9a-fA-F]{6}$/;
 
-    // Neon lighting: orange and blue rim lights
-    scene.add(new THREE.HemisphereLight(0xcbdcff, 0x202432, 1.6));
-    const keyLight = new THREE.DirectionalLight(0xffffff, 2.6);
-    keyLight.position.set(4, 7, 5);
-    scene.add(keyLight);
-    const orangeLight = new THREE.PointLight(0xff7a1a, 14, 0, 2);
-    orangeLight.position.set(-3, 2.5, 2.5);
-    scene.add(orangeLight);
-    const blueLight = new THREE.PointLight(0x2a8bff, 14, 0, 2);
-    blueLight.position.set(3, 2, -3);
-    scene.add(blueLight);
+function colorOf(component, fallback) {
+    return HEX_COLOR.test(component.color || "") ? component.color : fallback;
+}
 
-    // Glowing floor grid (orange centre lines, blue grid)
-    const grid = new THREE.GridHelper(10, 40, 0xff7a1a, 0x1c3d78);
+function dimsOf(component) {
+    const d = Array.isArray(component.dimensions) ? component.dimensions : [];
+    return [0, 1, 2].map(i => (Number.isFinite(d[i]) && d[i] > 0 ? d[i] : 0.01));
+}
+
+function addBox(parent, material, size, pos = [0, 0, 0], rot = null) {
+    const mesh = new THREE.Mesh(new THREE.BoxGeometry(size[0], size[1], size[2]), material);
+    mesh.position.set(pos[0], pos[1], pos[2]);
+    if (rot) mesh.rotation.set(rot[0], rot[1], rot[2]);
+    parent.add(mesh);
+    return mesh;
+}
+
+function addCylinder(parent, material, radius, height, pos = [0, 0, 0], options = {}) {
+    const {
+        radiusBottom = radius, segments = 24, openEnded = false,
+        thetaStart = 0, thetaLength = TAU, rot = null
+    } = options;
+    const mesh = new THREE.Mesh(
+        new THREE.CylinderGeometry(radius, radiusBottom, height, segments, 1, openEnded, thetaStart, thetaLength),
+        material
+    );
+    mesh.position.set(pos[0], pos[1], pos[2]);
+    if (rot) mesh.rotation.set(rot[0], rot[1], rot[2]);
+    parent.add(mesh);
+    return mesh;
+}
+
+// Many identical small parts (holes, pads, pins, traces) in a single draw call.
+const _m4 = new THREE.Matrix4(), _q = new THREE.Quaternion(), _e = new THREE.Euler();
+const _p = new THREE.Vector3(), _s = new THREE.Vector3();
+function addInstanced(parent, geometry, material, items) {
+    if (!items.length) return null;
+    const mesh = new THREE.InstancedMesh(geometry, material, items.length);
+    items.forEach((item, i) => {
+        const r = item.rot || [0, 0, 0], s = item.scale || [1, 1, 1];
+        _p.set(item.pos[0], item.pos[1], item.pos[2]);
+        _e.set(r[0], r[1], r[2]);
+        _q.setFromEuler(_e);
+        _s.set(s[0], s[1], s[2]);
+        _m4.compose(_p, _q, _s);
+        mesh.setMatrixAt(i, _m4);
+    });
+    mesh.instanceMatrix.needsUpdate = true;
+    mesh.frustumCulled = false;
+    parent.add(mesh);
+    return mesh;
+}
+
+// Axial parts (resistor, LED, wire, screw, motor, ...) are built along +Y in an
+// "inner" group, which is then turned onto the longest axis of the plan's box.
+function longestAxisOf(dims, preferred = 1) {
+    let best = preferred;
+    for (let i = 0; i < 3; i++) if (dims[i] > dims[best] * 1.05) best = i;
+    return best;
+}
+function shortestAxisOf(dims, preferred = 1) {
+    let best = preferred;
+    for (let i = 0; i < 3; i++) if (dims[i] < dims[best] * 0.95) best = i;
+    return best;
+}
+// Box extents [x, y, z] of the inner group for a part whose axis is `axis` in the outer frame.
+function innerDims(dims, axis) {
+    if (axis === 0) return [dims[1], dims[0], dims[2]];   // inner +Y -> outer +X
+    if (axis === 2) return [dims[0], dims[2], dims[1]];   // inner +Y -> outer +Z
+    return [dims[0], dims[1], dims[2]];
+}
+function wrapAxial(inner, axis) {
+    if (axis === 0) inner.rotation.z = -HALF_PI;
+    else if (axis === 2) inner.rotation.x = HALF_PI;
+    const root = new THREE.Group();
+    root.add(inner);
+    return root;
+}
+
+class HelixCurve extends THREE.Curve {
+    constructor(radius, pitch, turns, y0) {
+        super();
+        this.radius = radius; this.pitch = pitch; this.turns = turns; this.y0 = y0;
+        this.arcLengthDivisions = Math.max(200, Math.ceil(turns * 24));
+    }
+    getPoint(t, target = new THREE.Vector3()) {
+        const angle = t * this.turns * TAU;
+        return target.set(Math.cos(angle) * this.radius, this.y0 + t * this.turns * this.pitch, Math.sin(angle) * this.radius);
+    }
+}
+
+/* ------------------------------- resistor ------------------------------- */
+
+const BAND_COLORS = [0x111111, 0x7a3b12, 0xd62b1f, 0xf28a1e, 0xf2d21e, 0x2fa84f, 0x2a5fd0, 0x7b3fb5, 0x8a8f98, 0xf2f2f2];
+const BAND_GOLD = 0xc9a227, BAND_SILVER = 0xc0c4c8;
+
+// Reads a value such as "330 Ω", "4.7k ohm" or "1 MΩ" from the part's name / function.
+// Returns the three significant colour bands, or null when no value is stated.
+function resistorBands(component) {
+    const text = `${component.name || ""} ${component.function || ""}`;
+    const match = text.match(/(\d+(?:\.\d+)?)\s*([kKM])?\s*(?:[\u03A9\u2126]|[Oo]hms?\b)/);
+    if (!match) return null;
+    let value = parseFloat(match[1]);
+    if (match[2] === "k" || match[2] === "K") value *= 1e3;
+    else if (match[2] === "M") value *= 1e6;
+    if (!(value >= 1)) return null;
+    let exponent = Math.floor(Math.log10(value) + 1e-9);
+    let significant = Math.round(value / Math.pow(10, exponent - 1));
+    if (significant >= 100) { significant = 10; exponent += 1; }
+    const multiplier = exponent - 1;
+    if (multiplier < -2 || multiplier > 9) return null;
+    const multiplierColor = multiplier === -1 ? BAND_GOLD : multiplier === -2 ? BAND_SILVER : BAND_COLORS[multiplier];
+    return [BAND_COLORS[Math.floor(significant / 10)], BAND_COLORS[significant % 10], multiplierColor];
+}
+
+function createResistor(component) {
+    const dims = dimsOf(component);
+    const axis = longestAxisOf(dims, 0);                 // lies along X by convention
+    const [a, L, b] = innerDims(dims, axis);
+    const dia = Math.min(a, b);
+    const bodyR = dia / 2;
+    const bodyLen = Math.min(dia * 2.6, L * 0.62);
+    const coreR = bodyR * 0.82;
+    const inner = new THREE.Group();
+
+    addCylinder(inner, metal(0xc9ced4, { roughness: 0.35 }), dia * 0.11, L, [0, 0, 0], { segments: 10 });
+
+    const bodyMat = mat(colorOf(component, "#d9b27c"), { roughness: 0.6 });
+    addCylinder(inner, bodyMat, coreR, bodyLen * 0.76, [0, 0, 0], { segments: 24 });
+    for (const s of [-1, 1]) addCylinder(inner, bodyMat, bodyR, bodyLen * 0.14, [0, s * bodyLen * 0.43, 0], { segments: 24 });
+
+    const bands = resistorBands(component) || [BAND_COLORS[1], BAND_COLORS[0], BAND_COLORS[2]];
+    const bandLen = bodyLen * 0.075;
+    const bandY = [-0.29, -0.17, -0.05, 0.27];
+    [...bands, BAND_GOLD].forEach((color, i) => {
+        const shiny = color === BAND_GOLD || color === BAND_SILVER;
+        addCylinder(inner, mat(color, { roughness: 0.5, metalness: shiny ? 0.5 : 0 }),
+            coreR * 1.025, bandLen, [0, bandY[i] * bodyLen, 0], { segments: 24 });
+    });
+    return wrapAxial(inner, axis);
+}
+
+/* --------------------------------- LED ---------------------------------- */
+
+function createLED(component) {
+    const dims = dimsOf(component);
+    const axis = longestAxisOf(dims, 1);                 // stands along Y, dome up
+    const [a, L, b] = innerDims(dims, axis);
+    const D = Math.min(a, b);
+    const bodyH = Math.min(D * 1.7, L * 0.7);
+    const legLen = L - bodyH;
+    const y0 = -L / 2, yb = y0 + legLen;
+    const flangeH = bodyH * 0.1;
+    const domeR = Math.min(D * 0.43, bodyH * 0.55);
+    const cylH = Math.max(0, bodyH - flangeH - domeR);
+    const color = colorOf(component, "#ff2a2a");
+    const inner = new THREE.Group();
+
+    // Translucent epoxy lens: flange, straight wall and dome as one lathe profile.
+    const profile = [
+        new THREE.Vector2(0.00001, yb), new THREE.Vector2(D / 2, yb),
+        new THREE.Vector2(D / 2, yb + flangeH), new THREE.Vector2(domeR, yb + flangeH)
+    ];
+    if (cylH > 0) profile.push(new THREE.Vector2(domeR, yb + flangeH + cylH));
+    const capY = yb + flangeH + cylH;
+    for (let i = 1; i <= 10; i++) {
+        const t = (i / 10) * HALF_PI;
+        profile.push(new THREE.Vector2(Math.max(Math.cos(t) * domeR, 0.00001), capY + Math.sin(t) * domeR));
+    }
+    const lens = new THREE.MeshPhysicalMaterial({
+        color, transparent: true, opacity: 0.62, roughness: 0.12, metalness: 0,
+        clearcoat: 0.8, clearcoatRoughness: 0.1, emissive: color, emissiveIntensity: 0.16, depthWrite: false
+    });
+    inner.add(new THREE.Mesh(new THREE.LatheGeometry(profile, 28), lens));
+
+    // Internal anvil, post and bond wire, visible through the lens.
+    const steel = metal(0xbfc3c8, { roughness: 0.35 });
+    const px = D * 0.12, postBase = yb + flangeH * 0.5;
+    const cathodeH = bodyH * 0.55, anodeH = bodyH * 0.4;
+    addBox(inner, steel, [D * 0.06, cathodeH, D * 0.05], [-px, postBase + cathodeH / 2, 0]);
+    addCylinder(inner, steel, D * 0.14, D * 0.12, [-px, postBase + cathodeH, 0], { radiusBottom: D * 0.05, segments: 16 });
+    addBox(inner, steel, [D * 0.05, anodeH, D * 0.05], [px, postBase + anodeH / 2, 0]);
+    const bx0 = px, by0 = postBase + anodeH, bx1 = -px, by1 = postBase + cathodeH + D * 0.03;
+    addCylinder(inner, metal(0xd4af37, { roughness: 0.3 }), D * 0.012, Math.hypot(bx1 - bx0, by1 - by0),
+        [(bx0 + bx1) / 2, (by0 + by1) / 2, 0], { segments: 6, rot: [0, 0, Math.atan2(-(bx1 - bx0), by1 - by0)] });
+
+    // Flat leads: the longer one is the anode (+) on local +X; the shorter cathode (-) is on -X.
+    const spacing = D * 0.44, leadW = D * 0.09, leadT = D * 0.05;
+    const anodeLen = legLen + flangeH * 0.6;
+    const cathodeLen = legLen * 0.88 + flangeH * 0.6;
+    addBox(inner, steel, [leadW, anodeLen, leadT], [spacing / 2, y0 + anodeLen / 2, 0]);
+    addBox(inner, steel, [leadW, cathodeLen, leadT], [-spacing / 2, y0 + legLen * 0.12 + cathodeLen / 2, 0]);
+    return wrapAxial(inner, axis);
+}
+
+/* ------------------------------- capacitor ------------------------------ */
+
+function createCapacitor(component) {
+    const dims = dimsOf(component);
+    const axis = longestAxisOf(dims, 1);                 // radial electrolytic, leads down
+    const [a, L, b] = innerDims(dims, axis);
+    const D = Math.min(a, b), R = D / 2;
+    const bodyH = Math.min(L * 0.75, D * 1.8);
+    const legLen = L - bodyH;
+    const y0 = -L / 2, yb = y0 + legLen;
+    const sealH = bodyH * 0.06, topH = bodyH * 0.05;
+    const sleeveH = bodyH - sealH - topH;
+    const sleeveY = yb + sealH + sleeveH / 2;
+    const inner = new THREE.Group();
+
+    const steel = metal(0xc4c8cc, { roughness: 0.35 });
+    addCylinder(inner, mat(0x16171a, { roughness: 0.7 }), R * 0.97, sealH, [0, yb + sealH / 2, 0], { segments: 32 });
+    addCylinder(inner, mat(colorOf(component, "#1d3f8f"), { roughness: 0.45 }), R, sleeveH, [0, sleeveY, 0], { segments: 32 });
+    addCylinder(inner, steel, R * 0.97, topH, [0, yb + bodyH - topH / 2, 0], { segments: 32 });
+
+    // Scored vent cross on the aluminium top.
+    const vent = mat(0x8a8f94, { roughness: 0.5, metalness: 0.6 });
+    for (const rotY of [0, HALF_PI]) addBox(inner, vent, [R * 1.3, topH * 0.2, R * 0.07], [0, yb + bodyH - topH * 0.08, 0], [0, rotY, 0]);
+
+    // Light polarity stripe with minus marks on the negative (-X) side.
+    const arc = 0.62;
+    addCylinder(inner, mat(0xdfe4ea, { roughness: 0.6 }), R * 1.006, sleeveH * 0.96, [0, sleeveY, 0],
+        { segments: 12, openEnded: true, thetaStart: -HALF_PI - arc / 2, thetaLength: arc });
+    const mark = mat(0x1b1d22, { roughness: 0.7 });
+    for (let i = 0; i < 3; i++) {
+        addBox(inner, mark, [R * 0.02, sleeveH * 0.04, R * 0.3], [-R * 1.012, yb + sealH + sleeveH * (0.3 + i * 0.2), 0]);
+    }
+
+    // Leads: the longer one is positive (+X).
+    const leadR = D * 0.045, lx = D * 0.2;
+    const posLen = legLen + sealH * 0.5, negLen = legLen * 0.82 + sealH * 0.5;
+    addCylinder(inner, steel, leadR, posLen, [lx, y0 + posLen / 2, 0], { segments: 8 });
+    addCylinder(inner, steel, leadR, negLen, [-lx, y0 + legLen * 0.18 + negLen / 2, 0], { segments: 8 });
+    return wrapAxial(inner, axis);
+}
+
+/* -------------------------------- battery ------------------------------- */
+
+// Chooses cylindrical cell, coin cell or rectangular block from the proportions of the box.
+function batteryKind(dims) {
+    const order = [0, 1, 2].sort((i, j) => dims[j] - dims[i]);
+    const [iL, iM, iS] = order;
+    const L = dims[iL], M = dims[iM], S = dims[iS];
+    if (L / M > 1.4 && S / M > 0.85) return { kind: "cell", axis: iL };
+    if (S / L < 0.6 && M / L > 0.85) return { kind: "coin", axis: iS };
+    return { kind: "block", axis: iL };
+}
+
+function createBattery(component) {
+    const dims = dimsOf(component);
+    const { kind, axis } = batteryKind(dims);
+    const [a, L, b] = innerDims(dims, axis);
+    const inner = new THREE.Group();
+    const silver = metal(0xc7ccd2, { roughness: 0.32 });
+    const y0 = -L / 2;
+
+    if (kind === "cell") {
+        // Positive terminal nub at the +end of the long axis.
+        const R = Math.min(a, b) / 2;
+        const nubH = Math.min(R * 2 * 0.07, L * 0.05), capNeg = L * 0.03, capPos = L * 0.025;
+        const bodyH = L - capNeg - capPos - nubH;
+        addCylinder(inner, silver, R * 0.985, capNeg, [0, y0 + capNeg / 2, 0], { segments: 32 });
+        addCylinder(inner, mat(colorOf(component, "#d6a21c"), { roughness: 0.4 }), R, bodyH, [0, y0 + capNeg + bodyH / 2, 0], { segments: 32 });
+        addCylinder(inner, mat(0xeee8d8, { roughness: 0.5 }), R * 1.006, L * 0.07, [0, y0 + capNeg + bodyH * 0.62, 0], { segments: 32 });
+        addCylinder(inner, metal(0xd9b24c, { roughness: 0.35, metalness: 0.6 }), R * 1.004, L * 0.02, [0, y0 + capNeg + bodyH * 0.93, 0], { segments: 32 });
+        addCylinder(inner, silver, R * 0.985, capPos, [0, y0 + L - nubH - capPos / 2, 0], { segments: 32 });
+        addCylinder(inner, silver, R * 0.36, nubH, [0, y0 + L - nubH / 2, 0], { segments: 20 });
+    } else if (kind === "coin") {
+        // Flat disc; the positive face is +Y.
+        const R = Math.min(a, b) / 2;
+        addCylinder(inner, silver, R, L * 0.82, [0, y0 + L * 0.41, 0], { segments: 40 });
+        addCylinder(inner, mat(0x17181b, { roughness: 0.7 }), R * 0.99, L * 0.08, [0, y0 + L * 0.86, 0], { segments: 40 });
+        addCylinder(inner, metal(0xdadfe4, { roughness: 0.3 }), R * 0.93, L * 0.1, [0, y0 + L * 0.95, 0], { segments: 40 });
+    } else {
+        // Rectangular block (9 V style): snap terminals on the +Y end.
+        const topH = L * 0.1, snapH = L * 0.045, bodyH = L - topH - snapH;
+        addBox(inner, mat(colorOf(component, "#222831"), { roughness: 0.45 }), [a * 0.985, bodyH, b * 0.985], [0, y0 + bodyH / 2, 0]);
+        addBox(inner, mat(0xe3b93c, { roughness: 0.5 }), [a, bodyH * 0.3, b], [0, y0 + bodyH * 0.5, 0]);
+        addBox(inner, mat(0x1c1e22, { roughness: 0.6 }), [a * 0.97, topH, b * 0.97], [0, y0 + bodyH + topH / 2, 0]);
+        const snapY = y0 + bodyH + topH + snapH / 2;
+        const snapR = Math.min(a * 0.17, b * 0.3);
+        addCylinder(inner, silver, snapR, snapH, [a * 0.24, snapY, 0], { segments: 24 });          // positive: round stud
+        addCylinder(inner, silver, snapR * 1.1, snapH, [-a * 0.24, snapY, 0], { segments: 6 });    // negative: hex socket
+        addCylinder(inner, mat(0x0a0a0c, { roughness: 0.8 }), snapR * 0.5, snapH * 1.05, [-a * 0.24, snapY, 0], { segments: 12 });
+    }
+    return wrapAxial(inner, axis);
+}
+
+/* ------------------------------- breadboard ------------------------------ */
+
+function createBreadboard(component) {
+    const [W, H, D] = dimsOf(component);
+    const root = new THREE.Group();
+    const pitch = D / 21.65;                             // 2.54 mm for a 55 mm deep board
+    const eps = H * 0.012;
+    const top = H / 2;
+
+    addBox(root, mat(colorOf(component, "#ECEAE3"), { roughness: 0.5 }), [W, H, D]);
+
+    // Centre channel (between rows e and f) with two groove edges.
+    const stripLen = W - pitch * 0.4;
+    addBox(root, mat(0xcfcdc5, { roughness: 0.7 }), [stripLen, eps * 1.5, pitch * 1.9], [0, top, 0]);
+    const groove = mat(0x8f8d86, { roughness: 0.8 });
+    for (const s of [-1, 1]) addBox(root, groove, [stripLen, eps * 2.2, pitch * 0.08], [0, top, s * pitch * 0.95]);
+
+    // Terminal strips: 5 + 5 rows; power rails: 2 rows top and bottom in groups of 5.
+    const nCols = clamp(Math.floor(W / pitch) - 1, 5, 63);
+    const colX = i => (i - (nCols - 1) / 2) * pitch;
+    const hs = pitch * 0.55;
+    const holeScale = [hs, eps * 2, hs];
+    const holes = [];
+    for (const r of [-5.5, -4.5, -3.5, -2.5, -1.5, 1.5, 2.5, 3.5, 4.5, 5.5]) {
+        for (let i = 0; i < nCols; i++) holes.push({ pos: [colX(i), top, r * pitch], scale: holeScale });
+    }
+    const groups = Math.max(1, Math.floor((nCols + 1) / 6));
+    const railSpan = groups * 6 - 2;
+    for (const r of [-9, -8, 8, 9]) {
+        for (let g = 0; g < groups; g++) {
+            for (let k = 0; k < 5; k++) holes.push({ pos: [(g * 6 + k - railSpan / 2) * pitch, top, r * pitch], scale: holeScale });
+        }
+    }
+    addInstanced(root, UNIT_BOX, mat(0x22252b, { roughness: 0.85 }), holes);
+
+    // Red (+) and blue (-) rail guide lines.
+    const railLen = (railSpan + 1) * pitch;
+    const red = mat(0xd23a3a, { roughness: 0.6 }), blue = mat(0x2f6fd6, { roughness: 0.6 });
+    for (const [z, m] of [[-9.8, red], [-7.2, blue], [7.2, blue], [9.8, red]]) {
+        addBox(root, m, [railLen, eps * 1.4, pitch * 0.12], [0, top, z * pitch]);
+    }
+    return root;
+}
+
+/* ---------------------------------- PCB ---------------------------------- */
+
+function routeTrace(x0, z0, x1, z1) {
+    const dx = x1 - x0, dz = z1 - z0;
+    const adx = Math.abs(dx), adz = Math.abs(dz);
+    if (adx < 1e-9 || adz <= adx) return [[x0, z0], [x1, z1]];
+    const sz = Math.sign(dz);
+    const zb = z0 + sz * (adz - adx) / 2;
+    return [[x0, z0], [x0, zb], [x1, zb + sz * adx], [x1, z1]];            // straight, 45-degree dog-leg, straight
+}
+
+function traceInstances(points, width, y, thickness) {
+    const items = [];
+    for (let i = 0; i < points.length - 1; i++) {
+        const [xa, za] = points[i], [xb, zb] = points[i + 1];
+        const dx = xb - xa, dz = zb - za, len = Math.hypot(dx, dz);
+        if (len < 1e-9) continue;
+        items.push({ pos: [(xa + xb) / 2, y, (za + zb) / 2], rot: [0, -Math.atan2(dz, dx), 0], scale: [len + width, thickness, width] });
+    }
+    return items;
+}
+
+function addMountingHoles(parent, positions, y, holeR, ringR, ringMat, holeMat) {
+    const ringGeo = new THREE.RingGeometry(holeR, ringR, 24);
+    ringGeo.rotateX(-HALF_PI);
+    const holeGeo = new THREE.CircleGeometry(holeR, 24);
+    holeGeo.rotateX(-HALF_PI);
+    for (const [x, z] of positions) {
+        const ring = new THREE.Mesh(ringGeo, ringMat);
+        ring.position.set(x, y, z);
+        const hole = new THREE.Mesh(holeGeo, holeMat);
+        hole.position.set(x, y * 1.0 + holeR * 0.02, z);
+        parent.add(ring, hole);
+    }
+}
+
+function createPCB(component) {
+    const [W, H, D] = dimsOf(component);
+    const root = new THREE.Group();
+    const t = Math.max(H * 0.04, Math.min(W, D) * 0.0004);                 // copper thickness
+    const boardH = Math.max(H - t * 1.2, H * 0.5);                         // leave room inside the box for the raised copper
+    const topY = -H / 2 + boardH;
+    addBox(root, gloss(colorOf(component, "#0b6b3a"), { roughness: 0.5, clearcoat: 0.35 }), [W, boardH, D], [0, -H / 2 + boardH / 2, 0]);
+
+    const copper = metal(0xc77f3e, { roughness: 0.4, metalness: 0.75, polygonOffset: true, polygonOffsetFactor: -2, polygonOffsetUnits: -2 });
+    const tinned = metal(0xe0a45e, { roughness: 0.35, metalness: 0.8, polygonOffset: true, polygonOffsetFactor: -2, polygonOffsetUnits: -2 });
+    const dark = flat(0x15161a, { roughness: 0.8 });
+    const silk = flat(0xf0f0e8, { roughness: 0.8 });
+
+    // Two rows of 2.54 mm header pads along the long edges.
+    const p = Math.min(0.00254, D * 0.06);
+    const rowZ = Math.max(D / 2 - p * 2.4, D * 0.2);
+    const nPads = clamp(Math.floor((W * 0.7) / p), 4, 28);
+    const padR = p * 0.36;
+    const padX = i => (i - (nPads - 1) / 2) * p;
+    const pads = [], drills = [];
+    for (const sz of [-1, 1]) {
+        for (let i = 0; i < nPads; i++) {
+            pads.push({ pos: [padX(i), topY + t / 2, sz * rowZ], scale: [padR, t, padR] });
+            drills.push({ pos: [padX(i), topY + t * 0.55, sz * rowZ], scale: [padR * 0.45, t * 1.1, padR * 0.45] });
+        }
+    }
+    addInstanced(root, UNIT_CYLINDER, tinned, pads);
+    addInstanced(root, UNIT_CYLINDER, dark, drills);
+
+    // A central two-sided footprint, fanned out to the header pads with 45-degree traces.
+    const nIc = clamp(Math.floor(nPads / 2), 3, 8);
+    const pc = p * 0.5;
+    const icX = j => (j - (nIc - 1) / 2) * pc;
+    const icZ = clamp(D * 0.12, p * 1.4, rowZ * 0.55);
+    const icPads = [], traces = [];
+    const traceW = Math.max(p * 0.2, t * 2);
+    for (const sz of [-1, 1]) {
+        for (let j = 0; j < nIc; j++) {
+            icPads.push({ pos: [icX(j), topY + t / 2, sz * icZ], scale: [pc * 0.55, t, p * 0.9] });
+            const i = Math.min(nPads - 1, Math.floor((j + 0.5) * nPads / nIc));
+            const path = routeTrace(padX(i), sz * (rowZ - padR), icX(j), sz * (icZ + p * 0.45));
+            traces.push(...traceInstances(path, traceW, topY + t / 2, t));
+        }
+    }
+    addInstanced(root, UNIT_BOX, copper, icPads);
+    addInstanced(root, UNIT_BOX, copper, traces);
+
+    // Silkscreen outline around the footprint plus a pin-1 dot.
+    const sw = nIc * pc / 2 + pc, sd = icZ + p * 1.2, sl = Math.max(p * 0.1, t);
+    const silkY = topY + t * 0.25;
+    addBox(root, silk, [sw * 2, t * 0.5, sl], [0, silkY, -sd]);
+    addBox(root, silk, [sw * 2, t * 0.5, sl], [0, silkY, sd]);
+    addBox(root, silk, [sl, t * 0.5, sd * 2], [-sw, silkY, 0]);
+    addBox(root, silk, [sl, t * 0.5, sd * 2], [sw, silkY, 0]);
+    addCylinder(root, silk, p * 0.18, t * 0.5, [-sw + p * 0.6, silkY, -sd + p * 0.6], { segments: 12 });
+
+    // Mounting holes (copper ring + dark drill) at the corners.
+    const inset = Math.min(W, D) * 0.07;
+    const holeR = Math.min(W, D) * 0.022;
+    const corners = [[-1, -1], [-1, 1], [1, -1], [1, 1]].map(([sx, sz]) => [sx * (W / 2 - inset), sz * (D / 2 - inset)]);
+    addMountingHoles(root, corners, topY + t * 0.5, holeR, holeR * 1.8, copper, dark);
+    return root;
+}
+
+/* ----------------------------------- wire -------------------------------- */
+
+function createWire(component) {
+    const dims = dimsOf(component);
+    const axis = longestAxisOf(dims, 0);                 // long axis is X by convention
+    const [a, L, b] = innerDims(dims, axis);
+    const d = Math.min(a, b), R = d / 2;
+    const tipLen = Math.min(L * 0.12, d * 2.4);
+    const inner = new THREE.Group();
+
+    addCylinder(inner, mat(colorOf(component, "#d62b1f"), { roughness: 0.45 }), R, L - 2 * tipLen, [0, 0, 0], { segments: 16 });
+    const tip = metal(0xd2a679, { roughness: 0.3 });
+    for (const s of [-1, 1]) addCylinder(inner, tip, R * 0.42, tipLen, [0, s * (L / 2 - tipLen / 2), 0], { segments: 10 });
+    return wrapAxial(inner, axis);
+}
+
+/* ----------------------------- microcontroller --------------------------- */
+
+function createMicrocontroller(component) {
+    const [W, H, D] = dimsOf(component);
+    const root = new THREE.Group();
+    const pcbT = Math.min(H * 0.4, D * 0.03);
+    const hAvail = Math.max(H - pcbT, 1e-6);
+    const yTop = -H / 2 + pcbT;
+
+    addBox(root, gloss(colorOf(component, "#1f6fb5"), { roughness: 0.5, clearcoat: 0.35 }), [W, pcbT, D], [0, -H / 2 + pcbT / 2, 0]);
+
+    const black = mat(0x17181c, { roughness: 0.5 });
+    const grey = mat(0x2a2c31, { roughness: 0.55 });
+    const steel = metal(0xbcc1c7, { roughness: 0.3 });
+    const sit = (material, size, x, z, rot = null) => addBox(root, material, size, [x, yTop + size[1] / 2, z], rot);
+
+    // USB-style connector and power jack on the -X edge.
+    sit(steel, [W * 0.17, hAvail, D * 0.22], -W / 2 + W * 0.085, -D * 0.17);
+    addBox(root, black, [W * 0.006, hAvail * 0.5, D * 0.15], [-W / 2 + W * 0.0028, yTop + hAvail * 0.5, -D * 0.17]);
+    sit(black, [W * 0.17, hAvail * 0.8, D * 0.22], -W / 2 + W * 0.085, D * 0.2);
+
+    // Female headers along both long edges.
+    const pH = Math.min(0.00254, D * 0.0476);
+    const hdrH = hAvail * 0.62;
+    const nHdr = clamp(Math.floor((W * 0.64) / pH), 4, 18);
+    const sockets = [];
+    for (const sz of [-1, 1]) {
+        const z = sz * (D / 2 - pH * 0.9), x0 = W * 0.06;
+        sit(grey, [nHdr * pH, hdrH, pH], x0, z);
+        for (let i = 0; i < nHdr; i++) {
+            sockets.push({ pos: [x0 + (i - (nHdr - 1) / 2) * pH, yTop + hdrH, z], scale: [pH * 0.55, hdrH * 0.03, pH * 0.55] });
+        }
+    }
+    addInstanced(root, UNIT_BOX, mat(0x07080a, { roughness: 0.9 }), sockets);
+
+    // Main IC (DIP style) with legs and a pin-1 mark.
+    const icW = Math.min(14 * pH, W * 0.42), icD = D * 0.15;
+    const icX = W * 0.12, icZ = D * 0.08;
+    sit(black, [icW, hAvail * 0.3, icD], icX, icZ);
+    const nLegs = Math.max(4, Math.floor(icW / pH));
+    const legs = [];
+    for (const sz of [-1, 1]) {
+        for (let i = 0; i < nLegs; i++) {
+            legs.push({ pos: [icX + (i - (nLegs - 1) / 2) * pH, yTop + hAvail * 0.05, icZ + sz * (icD / 2 + pH * 0.12)], scale: [pH * 0.26, hAvail * 0.04, pH * 0.3] });
+        }
+    }
+    addInstanced(root, UNIT_BOX, steel, legs);
+    addCylinder(root, mat(0xdadada, { roughness: 0.8 }), pH * 0.2, hAvail * 0.01, [icX - icW / 2 + pH * 0.45, yTop + hAvail * 0.3, icZ - icD / 2 + pH * 0.45], { segments: 12 });
+
+    // ICSP block (2 x 3 pins).
+    const icspX = W / 2 - W * 0.06;
+    sit(black, [pH * 2, hAvail * 0.12, pH * 3], icspX, 0);
+    const pins = [];
+    for (let i = 0; i < 2; i++) for (let j = 0; j < 3; j++) {
+        pins.push({ pos: [icspX + (i - 0.5) * pH, yTop + hAvail * 0.12 + hAvail * 0.07, (j - 1) * pH], scale: [pH * 0.22, hAvail * 0.14, pH * 0.22] });
+    }
+    addInstanced(root, UNIT_BOX, metal(0xd9b24c, { roughness: 0.3 }), pins);
+
+    // Crystal, two electrolytic capacitors, reset button, regulator and two SMD LEDs.
+    sit(steel, [W * 0.05, hAvail * 0.28, D * 0.03], -W * 0.02, D * 0.22);
+    const canMat = mat(0x1c1c22, { roughness: 0.5 });
+    for (const z of [-0.03, 0.12]) {
+        const x = -W * 0.22, h = hAvail * 0.55, r = D * 0.045;
+        addCylinder(root, canMat, r, h, [x, yTop + h / 2, D * z], { segments: 20 });
+        addCylinder(root, steel, r * 0.96, h * 0.04, [x, yTop + h, D * z], { segments: 20 });
+    }
+    sit(steel, [D * 0.07, hAvail * 0.14, D * 0.07], -W * 0.12, -D * 0.27);
+    addCylinder(root, mat(0xc0392b, { roughness: 0.5 }), D * 0.022, hAvail * 0.1, [-W * 0.12, yTop + hAvail * 0.14 + hAvail * 0.05, -D * 0.27], { segments: 16 });
+    sit(black, [W * 0.045, hAvail * 0.14, D * 0.06], -W * 0.1, D * 0.2);
+    sit(mat(0x27ae60, { roughness: 0.4 }), [D * 0.025, hAvail * 0.06, D * 0.04], W * 0.3, -D * 0.2);
+    sit(mat(0xf1c40f, { roughness: 0.4 }), [D * 0.025, hAvail * 0.06, D * 0.04], W * 0.3, -D * 0.12);
+
+    const holeR = Math.min(W, D) * 0.022;
+    const copper = metal(0xc77f3e, { roughness: 0.4, polygonOffset: true, polygonOffsetFactor: -2, polygonOffsetUnits: -2 });
+    addMountingHoles(root, [[W * 0.44, -D * 0.3], [W * 0.44, D * 0.3], [-W * 0.12, D * 0.34]],
+        yTop + pcbT * 0.02, holeR, holeR * 1.8, copper, flat(0x15161a, { roughness: 0.8 }));
+    return root;
+}
+
+/* ---------------------------------- screw -------------------------------- */
+
+function createScrew(component) {
+    const dims = dimsOf(component);
+    const axis = longestAxisOf(dims, 1);                 // head up (+Y), tip down
+    const [a, L, b] = innerDims(dims, axis);
+    const headD = Math.min(a, b), headR = headD / 2;
+    const headH = Math.min(headD * 0.55, L * 0.4);
+    const shaftR = headR * 0.52, coreR = shaftR * 0.84;
+    const shaftLen = L - headH;
+    const tipLen = Math.min(shaftR * 1.2, shaftLen * 0.3);
+    const y0 = -L / 2;
+    const inner = new THREE.Group();
+    const steel = metal(colorOf(component, "#b4b9bf"), { roughness: 0.38 });
+
+    addCylinder(inner, steel, headR * 0.9, headH, [0, L / 2 - headH / 2, 0], { radiusBottom: headR, segments: 32 });
+    const slot = mat(0x1e2024, { roughness: 0.7 });
+    addBox(inner, slot, [headD * 0.62, headH * 0.08, headD * 0.12], [0, L / 2 - headH * 0.02, 0]);
+    addBox(inner, slot, [headD * 0.12, headH * 0.08, headD * 0.62], [0, L / 2 - headH * 0.02, 0]);
+
+    addCylinder(inner, steel, coreR, shaftLen - tipLen, [0, y0 + tipLen + (shaftLen - tipLen) / 2, 0], { segments: 20 });
+    const tip = new THREE.Mesh(new THREE.ConeGeometry(coreR, tipLen, 20), steel);
+    tip.rotation.x = Math.PI;                                              // apex points down
+    tip.position.y = y0 + tipLen / 2;
+    inner.add(tip);
+
+    // Simplified thread: one helical ridge along the shaft, with a short plain neck under the head.
+    const pitch = shaftR * 0.55;
+    const threadStart = y0 + tipLen * 0.5;
+    const threadLen = y0 + shaftLen * 0.92 - threadStart;
+    if (threadLen > pitch * 2) {
+        const turns = threadLen / pitch;
+        const curve = new HelixCurve(shaftR * 0.88, pitch, turns, threadStart);
+        inner.add(new THREE.Mesh(new THREE.TubeGeometry(curve, Math.ceil(turns * 14), shaftR * 0.12, 5, false), steel));
+    }
+    return wrapAxial(inner, axis);
+}
+
+/* ---------------------------------- motor -------------------------------- */
+
+function createMotor(component) {
+    const dims = dimsOf(component);
+    const axis = longestAxisOf(dims, 1);                 // shaft toward the +end of the long axis
+    const [a, L, b] = innerDims(dims, axis);
+    const R = Math.min(a, b) / 2;
+    const tabLen = L * 0.05, rearH = L * 0.05, frontH = L * 0.05, bossH = L * 0.04, shaftLen = L * 0.2;
+    const canLen = L - tabLen - rearH - frontH - bossH - shaftLen;
+    let y = -L / 2;
+    const inner = new THREE.Group();
+    const steel = metal(0xc3c8ce, { roughness: 0.32 });
+    const plastic = mat(0x17181c, { roughness: 0.55 });
+
+    for (const s of [-1, 1]) addBox(inner, steel, [R * 0.22, tabLen * 1.05, R * 0.05], [s * R * 0.4, y + tabLen * 0.5, 0]);
+    y += tabLen;
+    addCylinder(inner, plastic, R * 0.98, rearH, [0, y + rearH / 2, 0], { segments: 32 });
+    y += rearH;
+    addCylinder(inner, metal(colorOf(component, "#a9afb7"), { roughness: 0.4, metalness: 0.75 }), R, canLen, [0, y + canLen / 2, 0], { segments: 40 });
+    y += canLen;
+    addCylinder(inner, plastic, R * 0.98, frontH, [0, y + frontH / 2, 0], { segments: 32 });
+    y += frontH;
+
+    // Mounting ears with screw holes on the front plate.
+    const earH = bossH * 0.9, holeMat = mat(0x050506, { roughness: 0.9 });
+    for (const s of [-1, 1]) {
+        addCylinder(inner, steel, R * 0.16, earH, [s * R * 0.62, y + earH / 2, 0], { segments: 16 });
+        addCylinder(inner, holeMat, R * 0.07, earH * 0.1, [s * R * 0.62, y + earH, 0], { segments: 12 });
+    }
+    addCylinder(inner, steel, R * 0.22, bossH, [0, y + bossH / 2, 0], { segments: 20 });
+    y += bossH;
+    addCylinder(inner, metal(0xe1e4e8, { roughness: 0.22 }), R * 0.11, shaftLen + bossH * 0.5, [0, y + shaftLen / 2 - bossH * 0.25, 0], { segments: 14 });
+    return wrapAxial(inner, axis);
+}
+
+/* ----------------------------------- gear -------------------------------- */
+
+function extrudeFlat(shape, depth, curveSegments) {
+    const geometry = new THREE.ExtrudeGeometry(shape, { depth, bevelEnabled: false, curveSegments });
+    geometry.rotateX(-HALF_PI);                          // extrusion (+Z) becomes the Y axis
+    geometry.translate(0, -depth / 2, 0);
+    return geometry;
+}
+
+function createGear(component) {
+    const dims = dimsOf(component);
+    const axis = shortestAxisOf(dims, 1);                // spur gear: axis is the thin direction
+    const [a, T, b] = innerDims(dims, axis);
+    const outerR = Math.min(a, b) / 2;
+    const teeth = Math.round(clamp(8 + outerR * 2 * 350, 10, 30));
+    const rootR = outerR * 0.8, hubR = outerR * 0.28, boreR = outerR * 0.1;
+    const pitchAngle = TAU / teeth;
+
+    const shape = new THREE.Shape();
+    const pts = [];
+    for (let i = 0; i < teeth; i++) {
+        const c = (i + 0.5) * pitchAngle;
+        for (const [f, r] of [[-0.34, rootR], [-0.17, outerR], [0.17, outerR], [0.34, rootR]]) {
+            pts.push([Math.cos(c + f * pitchAngle) * r, Math.sin(c + f * pitchAngle) * r]);
+        }
+    }
+    shape.moveTo(pts[0][0], pts[0][1]);
+    for (let i = 1; i < pts.length; i++) shape.lineTo(pts[i][0], pts[i][1]);
+    shape.closePath();
+
+    const bore = new THREE.Path();
+    bore.absarc(0, 0, boreR, 0, TAU, true);
+    shape.holes.push(bore);
+    const web = rootR - hubR;
+    if (web > outerR * 0.3) {                            // lightening holes in the web
+        for (let i = 0; i < 5; i++) {
+            const ang = (i + 0.5) * TAU / 5, cr = (hubR + rootR) / 2;
+            const hole = new THREE.Path();
+            hole.absarc(Math.cos(ang) * cr, Math.sin(ang) * cr, web * 0.22, 0, TAU, true);
+            shape.holes.push(hole);
+        }
+    }
+
+    const hub = new THREE.Shape();
+    hub.absarc(0, 0, hubR, 0, TAU, false);
+    const hubBore = new THREE.Path();
+    hubBore.absarc(0, 0, boreR, 0, TAU, true);
+    hub.holes.push(hubBore);
+
+    const steel = metal(colorOf(component, "#a7adb5"), { roughness: 0.42, metalness: 0.7 });
+    const inner = new THREE.Group();
+    inner.add(new THREE.Mesh(extrudeFlat(shape, T * 0.64, 12), steel));
+    inner.add(new THREE.Mesh(extrudeFlat(hub, T, 20), steel));
+    return wrapAxial(inner, axis);
+}
+
+/* ------------------------- generic primitive fallback --------------------- */
+
+function createGeometry(component) {
+    const [a, b, c] = component.dimensions;
+    switch (component.geometry) {
+        case "box": return new THREE.BoxGeometry(a, b, c);
+        case "cylinder": return new THREE.CylinderGeometry(a, c, b, 32);
+        case "sphere": return new THREE.SphereGeometry(a, 24, 16);
+        case "cone": return new THREE.ConeGeometry(a, b, 32);
+        case "torus": {
+            const geometry = new THREE.TorusGeometry(a, b, 16, 32);
+            geometry.rotateX(-Math.PI / 2);              // the plan defines toruses in the XZ plane
+            return geometry;
+        }
+        default:
+            console.warn(`Unsupported geometry "${component.geometry}"; drawing a box instead.`);
+            return new THREE.BoxGeometry(a, b, c);
+    }
+}
+
+// The original one-primitive renderer, used for "generic" parts, unknown types and old plans.
+function createGenericMesh(component) {
+    const material = new THREE.MeshStandardMaterial({
+        color: component.color,
+        roughness: 0.45,
+        metalness: component.material === "metalness" ? 0.65 : 0.12,
+        side: THREE.DoubleSide
+    });
+    const mesh = new THREE.Mesh(createGeometry(component), material);
+    // Holographic blue outline
+    mesh.add(new THREE.LineSegments(
+        new THREE.EdgesGeometry(mesh.geometry, 25),
+        new THREE.LineBasicMaterial({ color: 0x66b3ff, transparent: true, opacity: 0.55 })
+    ));
+    return mesh;
+}
+
+const COMPONENT_BUILDERS = {
+    resistor: createResistor, led: createLED, capacitor: createCapacitor, battery: createBattery,
+    breadboard: createBreadboard, pcb: createPCB, wire: createWire, microcontroller: createMicrocontroller,
+    screw: createScrew, motor: createMotor, gear: createGear
+};
+
+function createDetailedComponent(component) {
+    const builder = COMPONENT_BUILDERS[component.component_type];
+    if (!builder) return createGenericMesh(component);   // "generic", unknown, or an old plan without component_type
+    try {
+        return builder(component);
+    } catch (error) {
+        console.error(`Could not build the ${component.component_type} model for "${component.id}"; using a primitive instead.`, error);
+        return createGenericMesh(component);
+    }
+}
+
+/* -------- per-component materials: isolation, opacity and highlight ------- */
+
+// Original (intrinsic) state of every material we manage, so fades and highlights are always reversible.
+const materialBase = new WeakMap();
+const claimedMaterials = new WeakSet();
+const GLOW_COLOR = new THREE.Color(0xff7a1a);
+
+function materialsOf(object) {
+    if (!object.material) return [];
+    return Array.isArray(object.material) ? object.material : [object.material];
+}
+
+// Gives the component its own copies of any material another component already uses and
+// records each material's base opacity / emissive state.  Call once per built root.
+function prepareComponentMaterials(root) {
+    const local = new Map();
+    root.traverse(object => {
+        if (!object.material) return;
+        const swap = m => {
+            if (local.has(m)) return local.get(m);
+            const own = claimedMaterials.has(m) ? m.clone() : m;
+            claimedMaterials.add(own);
+            materialBase.set(own, {
+                opacity: own.opacity,
+                transparent: own.transparent,
+                depthWrite: own.depthWrite,
+                emissive: own.emissive ? own.emissive.clone() : null,
+                emissiveIntensity: own.emissiveIntensity === undefined ? 0 : own.emissiveIntensity
+            });
+            local.set(m, own);
+            return own;
+        };
+        object.material = Array.isArray(object.material) ? object.material.map(swap) : swap(object.material);
+    });
+}
+
+// `factor` multiplies each material's own opacity (so translucent lenses stay translucent).
+function setRootOpacity(root, factor) {
+    root.traverse(object => {
+        for (const m of materialsOf(object)) {
+            const base = materialBase.get(m);
+            if (!base) continue;
+            const opacity = clamp(base.opacity * factor, 0, 1);
+            const blended = opacity < 0.999 || base.transparent;
+            if (m.opacity !== opacity) m.opacity = opacity;
+            if (m.transparent !== blended) { m.transparent = blended; m.needsUpdate = true; }
+            const depthWrite = opacity < 0.999 ? false : base.depthWrite;
+            if (m.depthWrite !== depthWrite) m.depthWrite = depthWrite;
+        }
+    });
+}
+
+// amount 0 restores each material's own emissive state; 1 is the full orange assembly flash.
+function setRootGlow(root, amount) {
+    const k = clamp(amount, 0, 1);
+    root.traverse(object => {
+        for (const m of materialsOf(object)) {
+            const base = materialBase.get(m);
+            if (!base || !base.emissive) continue;
+            if (k < 0.001) {
+                m.emissive.copy(base.emissive);
+                m.emissiveIntensity = base.emissiveIntensity;
+            } else {
+                m.emissive.copy(base.emissive).lerp(GLOW_COLOR, k);
+                m.emissiveIntensity = lerp(base.emissiveIntensity, 1.3, k);
+            }
+        }
+    });
+}
+
+// ===========================================================================
+// VIEWER: scene, assembly playback and UI
+// ===========================================================================
+
+const plan = JSON.parse(document.getElementById("assembly-plan-data").textContent);
+const $ = id => document.getElementById(id);
+
+const container = $("three-container"), statusEl = $("viewer-status"), emptyEl = $("viewer-empty");
+const previousBtn = $("previous-btn"), nextBtn = $("next-btn"), playBtn = $("play-btn"),
+      pauseBtn = $("pause-btn"), resetBtn = $("reset-btn"), fitBtn = $("fit-btn");
+const stepTitle = $("step-title"), stepDescription = $("step-description"),
+      stepCounter = $("step-counter"), stepTrack = $("step-track"), componentList = $("component-list");
+
+const lerpVector = (from, to, t) => from.map((value, index) => lerp(value, to[index], t));
+const isVec = v => Array.isArray(v) && v.length === 3 && v.every(Number.isFinite);
+const easeInOut = t => t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
+const waitForFrame = () => new Promise(resolve => {
+    let done = false;
+    const finish = () => { if (!done) { done = true; resolve(); } };
+    requestAnimationFrame(finish);
+    setTimeout(finish, 120);                       // never wait forever (e.g. in a background tab)
+});
+const viewportSize = () => ({ width: Math.max(1, container.clientWidth), height: Math.max(1, container.clientHeight) });
+
+/* ------------------------- renderer, camera, controls -------------------- */
+
+const scene = new THREE.Scene();
+
+const initialSize = viewportSize();
+const camera = new THREE.PerspectiveCamera(45, initialSize.width / initialSize.height, 0.001, 1000);
+camera.position.set(...plan.camera.position);
+
+// Transparent canvas so the page's glow shows through.
+const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true, powerPreference: "high-performance" });
+renderer.setClearColor(0x000000, 0);
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+renderer.setSize(initialSize.width, initialSize.height);
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+if (THREE.NeutralToneMapping !== undefined) renderer.toneMapping = THREE.NeutralToneMapping;   // keeps part colours true
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+container.appendChild(renderer.domElement);
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.target.set(...plan.camera.target);
+controls.enableDamping = true;
+controls.dampingFactor = 0.07;
+controls.autoRotate = true;          // slow showcase spin until the user grabs the model
+controls.autoRotateSpeed = 0.9;
+controls.addEventListener("start", () => { controls.autoRotate = false; });
+controls.update();
+
+/* ---------------------------------- lights -------------------------------- */
+
+// Positions and shadow bounds are fitted to the device size in configureScene().
+const hemiLight = new THREE.HemisphereLight(0xcbdcff, 0x202432, 0.8);
+const keyLight = new THREE.DirectionalLight(0xffffff, 2.2);
+keyLight.castShadow = true;
+keyLight.shadow.mapSize.set(2048, 2048);
+const orangeLight = new THREE.PointLight(0xff7a1a, 1, 0, 2);     // neon rim lights
+const blueLight = new THREE.PointLight(0x2a8bff, 1, 0, 2);
+scene.add(hemiLight, keyLight, keyLight.target, orangeLight, blueLight);
+
+// Soft studio reflections so metal leads, screws and shafts look like metal.
+// Loaded separately: if it fails the viewer still works, metals are just flatter.
+import("https://cdn.jsdelivr.net/npm/three@0.180.0/examples/jsm/environments/RoomEnvironment.js")
+    .then(({ RoomEnvironment }) => {
+        const room = new RoomEnvironment();
+        const pmrem = new THREE.PMREMGenerator(renderer);
+        scene.environment = pmrem.fromScene(room, 0.04).texture;
+        scene.environmentIntensity = 0.6;
+        room.dispose();
+        pmrem.dispose();
+    })
+    .catch(error => console.warn("Environment lighting unavailable; metals will look flatter.", error));
+
+/* -------------------------------- components ------------------------------ */
+
+// component id -> root object: a THREE.Group for detailed parts, a THREE.Mesh for primitives.
+// Position and rotation live on this root; the meshes inside keep their local transforms.
+const meshes = new Map();
+let currentStep = 0, busy = false, playing = false, animationToken = 0, playRun = 0;
+
+function buildComponentRoot(component) {
+    const root = createDetailedComponent(component);
+    root.position.set(...component.position);
+    root.rotation.set(...component.rotation);
+    root.visible = false;
+    root.userData.component = component;
+    prepareComponentMaterials(root);
+    root.traverse(object => {
+        if (!object.isMesh) return;
+        const base = materialBase.get(materialsOf(object)[0]);
+        object.castShadow = !(base && base.transparent && base.opacity < 0.9);   // glass lenses don't cast hard shadows
+        object.receiveShadow = true;
+    });
+    return root;
+}
+
+for (const component of plan.components) {
+    const root = buildComponentRoot(component);
+    scene.add(root);
+    meshes.set(component.id, root);
+}
+
+// Component chips: click to flash the part in 3D
+const flashTokens = new Map();
+function flashComponent(id) {
+    const root = meshes.get(id);
+    if (!root || !root.visible) return;
+    controls.autoRotate = false;
+    const token = (flashTokens.get(id) || 0) + 1;
+    flashTokens.set(id, token);
+    const start = performance.now(), duration = 900;
+    const tick = () => {
+        if (flashTokens.get(id) !== token) return;
+        const t = (performance.now() - start) / duration;
+        if (t >= 1) { setRootGlow(root, 0); return; }
+        setRootGlow(root, Math.min(1, (1 - t) * 1.6));
+        requestAnimationFrame(tick);
+    };
+    tick();
+}
+
+for (const component of plan.components) {
+    const chip = document.createElement("span");
+    chip.className = "component-chip";
+    chip.textContent = component.name;
+    chip.title = `${component.component_type || "generic"} \u00b7 ${component.dimensions_verified ? "verified" : "estimated"} dimensions`
+        + (component.function ? ` \u00b7 ${component.function}` : "");
+    chip.addEventListener("click", () => flashComponent(component.id));
+    componentList.appendChild(chip);
+}
+
+for (const step of plan.assembly_steps) {
+    const dot = document.createElement("div");
+    dot.className = "step-dot";
+    dot.title = `Step ${step.step}: ${step.title}`;
+    stepTrack.appendChild(dot);
+}
+const dots = [...stepTrack.children];
+
+/* ------------------------ device bounds, environment, framing ------------- */
+
+const deviceBox = new THREE.Box3();
+meshes.forEach(root => deviceBox.expandByObject(root));
+if (deviceBox.isEmpty()) deviceBox.set(new THREE.Vector3(-0.1, 0, -0.1), new THREE.Vector3(0.1, 0.2, 0.1));
+const deviceCenter = deviceBox.getCenter(new THREE.Vector3());
+const deviceSize = deviceBox.getSize(new THREE.Vector3());
+const deviceRadius = Math.max(deviceSize.length() / 2, 0.02);
+
+function niceStep(x) {
+    const p = Math.pow(10, Math.floor(Math.log10(x)));
+    const m = x / p;
+    return (m <= 1 ? 1 : m <= 2 ? 2 : m <= 5 ? 5 : 10) * p;
+}
+
+let grid = null, floorShadow = null, dust = null;
+
+// Everything that depends on how big the device is: lights, shadows, grid, dust.
+function configureScene() {
+    const r = deviceRadius, c = deviceCenter;
+
+    keyLight.position.set(c.x + r * 2.2, c.y + r * 3.6, c.z + r * 2.6);
+    keyLight.target.position.copy(c);
+    const shadowCam = keyLight.shadow.camera;
+    const extent = r * 1.7;
+    shadowCam.left = -extent; shadowCam.right = extent; shadowCam.top = extent; shadowCam.bottom = -extent;
+    shadowCam.near = r * 1.2; shadowCam.far = r * 10;
+    shadowCam.updateProjectionMatrix();
+    keyLight.shadow.bias = -0.0002;
+    keyLight.shadow.normalBias = r * 0.004;
+
+    // Point-light intensity grows with distance squared so the look is the same at any scale.
+    const orangeOffset = new THREE.Vector3(-2.2, 1.5, 1.6).multiplyScalar(r);
+    const blueOffset = new THREE.Vector3(2.2, 1.2, -2.2).multiplyScalar(r);
+    orangeLight.position.copy(c).add(orangeOffset);
+    blueLight.position.copy(c).add(blueOffset);
+    orangeLight.intensity = 0.5 * orangeOffset.lengthSq();
+    blueLight.intensity = 0.5 * blueOffset.lengthSq();
+
+    // Subtle ground grid whose cells scale with the device (about a dozen cells across it).
+    const cell = niceStep(Math.max(deviceSize.x, deviceSize.z, 0.02) / 12);
+    const gridSize = cell * 40;
+    grid = new THREE.GridHelper(gridSize, 40, 0xff7a1a, 0x1c3d78);
     grid.material.transparent = true;
-    grid.material.opacity = 0.55;
+    grid.material.opacity = 0.32;
+    grid.material.depthWrite = false;
+    grid.position.set(c.x, 0, c.z);
     scene.add(grid);
 
-    // Floating dust particles
-    const dustCount = 280, dustPos = new Float32Array(dustCount * 3);
-    for (let i = 0; i < dustCount; i++) {
-        dustPos[i * 3] = (Math.random() - 0.5) * 14;
-        dustPos[i * 3 + 1] = Math.random() * 6;
-        dustPos[i * 3 + 2] = (Math.random() - 0.5) * 14;
+    floorShadow = new THREE.Mesh(new THREE.PlaneGeometry(gridSize, gridSize), new THREE.ShadowMaterial({ opacity: 0.32 }));
+    floorShadow.rotation.x = -HALF_PI;
+    floorShadow.position.set(c.x, -r * 0.002, c.z);
+    floorShadow.receiveShadow = true;
+    scene.add(floorShadow);
+
+    // Faint floating dust, sized to the device.
+    const count = 160, spread = r * 3.2, positions = new Float32Array(count * 3);
+    for (let i = 0; i < count; i++) {
+        positions[i * 3] = (Math.random() - 0.5) * 2 * spread;
+        positions[i * 3 + 1] = Math.random() * r * 2.5;
+        positions[i * 3 + 2] = (Math.random() - 0.5) * 2 * spread;
     }
     const dustGeo = new THREE.BufferGeometry();
-    dustGeo.setAttribute("position", new THREE.BufferAttribute(dustPos, 3));
-    const dust = new THREE.Points(dustGeo, new THREE.PointsMaterial({
-        color: 0xff9a4d, size: 0.03, transparent: true, opacity: 0.75, depthWrite: false
+    dustGeo.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+    dust = new THREE.Points(dustGeo, new THREE.PointsMaterial({
+        color: 0xff9a4d, size: r * 0.02, transparent: true, opacity: 0.4, depthWrite: false
     }));
+    dust.position.set(c.x, 0, c.z);
     scene.add(dust);
+}
 
-    const meshes = new Map();
-    let currentStep = 0, busy = false, playing = false, animationToken = 0;
+// Fits the whole device in view, keeping the plan's viewing direction.
+// Only runs on load and from the "Fit view" button, so manual camera moves are never overridden.
+function frameDevice() {
+    const direction = new THREE.Vector3(...plan.camera.position).sub(new THREE.Vector3(...plan.camera.target));
+    if (!(direction.lengthSq() > 1e-12)) direction.set(0.7, 0.6, 1);
+    direction.normalize();
+    direction.y = Math.max(direction.y, 0.2);
+    direction.normalize();
 
-    function createGeometry(component) {
-        const [a, b, c] = component.dimensions;
+    const vFov = THREE.MathUtils.degToRad(camera.fov);
+    const hFov = 2 * Math.atan(Math.tan(vFov / 2) * camera.aspect);
+    const distance = (deviceRadius * 1.15) / Math.sin(Math.min(vFov, hFov) / 2);
 
-        switch (component.geometry) {
-            case "box": return new THREE.BoxGeometry(a, b, c);
-            case "cylinder": return new THREE.CylinderGeometry(a, c, b, 32);
-            case "sphere": return new THREE.SphereGeometry(a, 24, 16);
-            case "cone": return new THREE.ConeGeometry(a, b, 32);
-            case "torus": {
-                const geometry = new THREE.TorusGeometry(a, b, 16, 32);
-                // The AI schema defines toruses in the XZ plane; Three.js uses XY.
-                geometry.rotateX(-Math.PI / 2);
-                return geometry;
-            }
-            default:
-                throw new Error(`Unsupported geometry: ${component.geometry}`);
-        }
+    controls.target.copy(deviceCenter);
+    camera.position.copy(deviceCenter).addScaledVector(direction, distance);
+    camera.near = Math.max(deviceRadius * 0.01, 0.0005);
+    camera.far = Math.max(distance + deviceRadius, 1) * 50;
+    camera.updateProjectionMatrix();
+    controls.minDistance = deviceRadius * 0.1;
+    controls.maxDistance = distance * 12;
+    controls.update();
+}
+
+configureScene();
+frameDevice();
+
+/* ------------------------------- assembly state --------------------------- */
+
+function setFinalTransform(component) {
+    const root = meshes.get(component.id);
+    if (!root) return;
+    root.position.set(...component.position);
+    root.rotation.set(...component.rotation);
+    root.scale.set(1, 1, 1);
+    setRootGlow(root, 0);
+    setRootOpacity(root, component.opacity);
+}
+
+function updateUI() {
+    const total = plan.assembly_steps.length;
+    stepCounter.textContent = `Step ${currentStep} of ${total}`;
+
+    previousBtn.disabled = busy || currentStep === 0;
+    nextBtn.disabled = busy || currentStep >= total;
+    playBtn.disabled = busy || playing || currentStep >= total;
+    pauseBtn.disabled = !playing;
+    resetBtn.disabled = currentStep === 0 && !playing && !busy;
+    fitBtn.disabled = false;
+
+    dots.forEach((dot, index) => dot.classList.toggle("done", index < currentStep));
+
+    if (currentStep === 0) {
+        stepTitle.textContent = "Ready to assemble";
+        stepDescription.textContent = "Press Play to run the assembly or Next to move one step at a time.";
+    } else {
+        const completed = plan.assembly_steps[currentStep - 1];
+        stepTitle.textContent = completed.title;
+        stepDescription.textContent = completed.description;
     }
 
-    function createComponentMesh(component) {
-        const material = new THREE.MeshStandardMaterial({
-            color: component.color,
-            roughness: 0.45,
-            metalness: component.material === "metalness" ? 0.65 : 0.12,
-            transparent: component.opacity < 1,
-            opacity: component.opacity,
-            side: THREE.DoubleSide
-        });
+    statusEl.textContent = busy ? "ANIMATING" : playing ? "PLAYING"
+        : currentStep === total ? "ASSEMBLY COMPLETE" : "READY";
+}
 
-        const mesh = new THREE.Mesh(createGeometry(component), material);
-        mesh.position.set(...component.position);
-        mesh.rotation.set(...component.rotation);
-        mesh.visible = false;
-        mesh.userData.component = component;
-
-        // Holographic blue outline
-        mesh.add(new THREE.LineSegments(
-            new THREE.EdgesGeometry(mesh.geometry, 25),
-            new THREE.LineBasicMaterial({ color: 0x66b3ff, transparent: true, opacity: 0.55 })
-        ));
-
-        scene.add(mesh);
-        meshes.set(component.id, mesh);
-    }
-
-    for (const component of plan.components) createComponentMesh(component);
-
-    // Component chips: click to flash the part in 3D
+function setStepInstant(targetStep) {
+    currentStep = targetStep;
     for (const component of plan.components) {
-        const chip = document.createElement("span");
-        chip.className = "component-chip";
-        chip.textContent = component.name;
-        chip.addEventListener("click", () => {
-            const mesh = meshes.get(component.id);
-            if (!mesh || !mesh.visible) return;
-            controls.autoRotate = false;
-            mesh.material.emissive.set(0xff7a1a);
-            mesh.material.emissiveIntensity = 1.4;
-            setTimeout(() => { mesh.material.emissive.set(0x000000); mesh.material.emissiveIntensity = 0; }, 900);
-        });
-        componentList.appendChild(chip);
+        const root = meshes.get(component.id);
+        if (!root) continue;
+        root.visible = component.assembly_step <= targetStep;
+        setFinalTransform(component);
     }
+    updateUI();
+}
 
-    for (const step of plan.assembly_steps) {
-        const dot = document.createElement("div");
-        dot.className = "step-dot";
-        dot.title = `Step ${step.step}: ${step.title}`;
-        stepTrack.appendChild(dot);
-    }
-    const dots = [...stepTrack.children];
+/* -------------------------------- animation ------------------------------- */
 
-    function setMaterialOpacity(mesh, opacity) {
-        mesh.material.opacity = opacity;
-        mesh.material.transparent = opacity < 1;
-        mesh.material.needsUpdate = true;
-    }
+const ANIMATION_TYPES = new Set(["fade_in", "move_into_place", "rotate_into_place", "drop_into_place"]);
+const STAGGER_MS = 140;
+const dropDistance = clamp(deviceRadius * 0.9, 0.01, 1.5);   // how far parts travel when the plan gives no start pose
+const maxOffset = deviceRadius * 3;                          // never let a part start absurdly far away
 
-    function setFinalTransform(component) {
-        const mesh = meshes.get(component.id);
-        mesh.position.set(...component.position);
-        mesh.rotation.set(...component.rotation);
-        mesh.scale.set(1, 1, 1);
-        mesh.material.emissiveIntensity = 0;
-        setMaterialOpacity(mesh, component.opacity);
-    }
+// Start pose for one component. The end pose is always the component's real final transform.
+function startPose(component, hint) {
+    const to = component.position, toRot = component.rotation;
+    const type = ANIMATION_TYPES.has(hint.type) ? hint.type : "drop_into_place";
+    const same = (a, b) => a.every((v, i) => Math.abs(v - b[i]) < 1e-9);
+    let from = isVec(hint.from_position) && !same(hint.from_position, to) ? hint.from_position.slice() : null;
+    let fromRot = isVec(hint.from_rotation) && !same(hint.from_rotation, toRot) ? hint.from_rotation.slice() : null;
 
-    function updateUI() {
-        const total = plan.assembly_steps.length;
-        stepCounter.textContent = `Step ${currentStep} of ${total}`;
-
-        previousBtn.disabled = busy || currentStep === 0;
-        nextBtn.disabled = busy || currentStep >= total;
-        playBtn.disabled = busy || playing || currentStep >= total;
-        pauseBtn.disabled = !playing;
-        resetBtn.disabled = busy || (currentStep === 0 && !playing);
-
-        dots.forEach((dot, index) => dot.classList.toggle("done", index < currentStep));
-
-        if (currentStep === 0) {
-            stepTitle.textContent = "Ready to assemble";
-            stepDescription.textContent = "Press Play to run the assembly or Next to move one step at a time.";
-        } else {
-            const completed = plan.assembly_steps[currentStep - 1];
-            stepTitle.textContent = completed.title;
-            stepDescription.textContent = completed.description;
+    if (type === "fade_in") {
+        from = from || to.slice();
+        fromRot = fromRot || toRot.slice();
+    } else if (type === "move_into_place") {
+        if (!from) {                                         // glide in from outside the device
+            const dx = to[0] - deviceCenter.x, dz = to[2] - deviceCenter.z, len = Math.hypot(dx, dz);
+            const ux = len > 1e-9 ? dx / len : 1, uz = len > 1e-9 ? dz / len : 0;
+            from = [to[0] + ux * dropDistance * 0.8, to[1] + dropDistance * 0.3, to[2] + uz * dropDistance * 0.8];
         }
-
-        statusEl.textContent = busy ? "ANIMATING" : playing ? "PLAYING"
-            : currentStep === total ? "ASSEMBLY COMPLETE" : "READY";
+        fromRot = fromRot || toRot.slice();
+    } else if (type === "rotate_into_place") {
+        from = from || [to[0], to[1] + dropDistance * 0.15, to[2]];
+        fromRot = fromRot || [toRot[0], toRot[1] - HALF_PI, toRot[2]];
+    } else {                                                 // drop_into_place
+        from = from || [to[0], to[1] + dropDistance, to[2]];
+        fromRot = fromRot || toRot.slice();
     }
 
-    function setStepInstant(targetStep) {
-        currentStep = targetStep;
-        for (const component of plan.components) {
-            meshes.get(component.id).visible = component.assembly_step <= targetStep;
-            setFinalTransform(component);
-        }
-        updateUI();
-    }
+    const offset = from.map((v, i) => v - to[i]);
+    const distance = Math.hypot(...offset);
+    if (distance > maxOffset) from = to.map((v, i) => v + offset[i] * (maxOffset / distance));
+    return { type, from, to, fromRot, toRot };
+}
 
-    const easeInOut = t => t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
-    const lerp = (a, b, t) => a + (b - a) * t;
-    const lerpVector = (from, to, t) => from.map((value, index) => lerp(value, to[index], t));
-    const isVec = v => Array.isArray(v) && v.length === 3 && v.every(Number.isFinite);
-    const waitForFrame = () => new Promise(resolve => requestAnimationFrame(resolve));
+async function animateStep(step) {
+    const localToken = ++animationToken;
+    busy = true;
+    updateUI();
 
-    async function animateStep(step) {
-        const localToken = ++animationToken;
-        busy = true;
-        updateUI();
-
+    try {
         const hints = new Map((step.animations || []).map(a => [a.component_id, a]));
         const startTime = performance.now();
         const active = [];
 
-        step.component_ids.forEach((id, index) => {
+        (step.component_ids || []).forEach((id, index) => {
             const component = plan.components.find(c => c.id === id);
-            const mesh = meshes.get(id);
-            if (!component || !mesh) return;
-
+            const root = meshes.get(id);
+            if (!component || !root) return;
             const hint = hints.get(id) || {};
-            const fade = hint.type === "fade_in";
-            const to = component.position, toRot = component.rotation;   // always end at the real final transform
-            let from = isVec(hint.from_position) ? hint.from_position : to;
-            if (!fade && from.every((v, i) => v === to[i])) {
-                from = [to[0], to[1] + 0.35, to[2]];                     // default: drop in from above
-            }
-
-            mesh.material.emissive.set(0xff7a1a);
             active.push({
-                component, mesh, fade, from, to, toRot,
-                fromRot: isVec(hint.from_rotation) ? hint.from_rotation : toRot,
-                duration: hint.duration_ms || 700,
-                start: startTime + index * 160                           // stagger parts within a step
+                component, root,
+                pose: startPose(component, hint),
+                duration: clamp(Number(hint.duration_ms) || 700, 100, 10000),
+                start: startTime + index * STAGGER_MS                // stagger parts within a step
             });
         });
 
-        const total = Math.max(0, ...active.map(a => a.start - startTime + a.duration));
+        const end = Math.max(startTime, ...active.map(a => a.start + a.duration));
+        let now = performance.now();
 
-        while (performance.now() - startTime < total) {
-            if (localToken !== animationToken) { busy = false; return; }
-            const now = performance.now();
-
+        while (now < end) {
+            if (localToken !== animationToken) return;               // cancelled by Reset
             for (const a of active) {
                 if (now < a.start) continue;
-                a.mesh.visible = true;
+                a.root.visible = true;
                 const raw = Math.min(1, (now - a.start) / a.duration);
                 const t = easeInOut(raw);
-                a.mesh.position.set(...lerpVector(a.from, a.to, t));
-                a.mesh.rotation.set(...lerpVector(a.fromRot, a.toRot, t));
-                if (a.fade) setMaterialOpacity(a.mesh, a.component.opacity * raw);
-                a.mesh.material.emissiveIntensity = 1.4 * (1 - raw);
+                a.root.position.set(...lerpVector(a.pose.from, a.pose.to, t));
+                a.root.rotation.set(...lerpVector(a.pose.fromRot, a.pose.toRot, t));
+                const appear = a.pose.type === "fade_in" ? t : Math.min(1, raw * 5);
+                setRootOpacity(a.root, a.component.opacity * appear);
+                setRootGlow(a.root, 1 - raw);
             }
             await waitForFrame();
+            now = performance.now();
         }
-
-        active.forEach(a => setFinalTransform(a.component));
-        currentStep = step.step;
-        busy = false;
-        updateUI();
-    }
-
-    async function nextStep() {
-        if (busy || currentStep >= plan.assembly_steps.length) return;
-        await animateStep(plan.assembly_steps[currentStep]);
-    }
-
-    async function playAssembly() {
-        if (busy || playing) return;
-        playing = true;
-        updateUI();
-
-        while (playing && currentStep < plan.assembly_steps.length) {
-            await nextStep();
-            if (playing && currentStep < plan.assembly_steps.length) {
-                await new Promise(resolve => setTimeout(resolve, 250));
+    } catch (error) {
+        console.error("Assembly animation failed; jumping to the finished step.", error);
+    } finally {
+        // Whatever happened, release the busy flag and land every part of this step on its true final pose.
+        // A newer animation or a Reset owns the state if the token has moved on.
+        if (localToken === animationToken) {
+            currentStep = step.step;
+            busy = false;
+            for (const id of step.component_ids || []) {
+                try {
+                    const component = plan.components.find(c => c.id === id);
+                    const root = meshes.get(id);
+                    if (!component || !root) continue;
+                    root.visible = true;
+                    setFinalTransform(component);
+                } catch (error) {
+                    console.error(`Could not finish "${id}".`, error);
+                }
             }
+            updateUI();
         }
+    }
+}
 
+async function nextStep() {
+    if (busy || currentStep >= plan.assembly_steps.length) return;
+    await animateStep(plan.assembly_steps[currentStep]);
+}
+
+async function playAssembly() {
+    if (busy || playing) return;
+    const run = ++playRun;
+    playing = true;
+    updateUI();
+
+    while (run === playRun && playing && currentStep < plan.assembly_steps.length) {
+        await nextStep();
+        if (run === playRun && playing && currentStep < plan.assembly_steps.length) {
+            await new Promise(resolve => setTimeout(resolve, 250));
+        }
+    }
+
+    if (run === playRun) {
         playing = false;
         updateUI();
     }
+}
 
-    function pauseAssembly() { playing = false; updateUI(); }
+function pauseAssembly() { playing = false; updateUI(); }
 
-    function resetAssembly() {
-        if (busy) return;
-        playing = false;
-        animationToken++;
-        setStepInstant(0);
-    }
-
-    previousBtn.addEventListener("click", () => {
-        if (busy) return;
-        playing = false;
-        setStepInstant(Math.max(0, currentStep - 1));
-    });
-    nextBtn.addEventListener("click", nextStep);
-    playBtn.addEventListener("click", playAssembly);
-    pauseBtn.addEventListener("click", pauseAssembly);
-    resetBtn.addEventListener("click", resetAssembly);
-
-    // Keep the viewer correctly sized when the layout changes.
-    new ResizeObserver(() => {
-        const width = container.clientWidth, height = container.clientHeight;
-        if (!width || !height) return;
-        camera.aspect = width / height;
-        camera.updateProjectionMatrix();
-        renderer.setSize(width, height);
-    }).observe(container);
-
-    function render() {
-        requestAnimationFrame(render);
-        dust.rotation.y += 0.0007;
-        controls.update();
-        renderer.render(scene, camera);
-    }
-
+function resetAssembly() {
+    playing = false;
+    playRun++;
+    animationToken++;                                        // cancels any animation in flight
+    busy = false;
     setStepInstant(0);
-    emptyEl.style.display = "none";
-    render();
+}
+
+previousBtn.addEventListener("click", () => {
+    if (busy) return;
+    playing = false;
+    setStepInstant(Math.max(0, currentStep - 1));
+});
+nextBtn.addEventListener("click", nextStep);
+playBtn.addEventListener("click", playAssembly);
+pauseBtn.addEventListener("click", pauseAssembly);
+resetBtn.addEventListener("click", resetAssembly);
+fitBtn.addEventListener("click", () => { controls.autoRotate = false; frameDevice(); });
+
+// Keep the viewer correctly sized when the layout changes.
+new ResizeObserver(() => {
+    const { width, height } = viewportSize();
+    camera.aspect = width / height;
+    camera.updateProjectionMatrix();
+    renderer.setSize(width, height);
+}).observe(container);
+
+function render() {
+    requestAnimationFrame(render);
+    if (dust) dust.rotation.y += 0.0007;
+    controls.update();
+    renderer.render(scene, camera);
+}
+
+// Small handle for debugging in the browser console.
+window.circuitPilot = { plan, scene, camera, controls, components: meshes, frameDevice, setStepInstant };
+
+setStepInstant(0);
+emptyEl.style.display = "none";
+render();
 </script>
 {% endif %}
 </body>
