@@ -7,6 +7,7 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&family=Space+Grotesk:wght@400;500;700&display=swap" rel="stylesheet">
+
 <style>
 :root{
   color-scheme:dark;
@@ -113,10 +114,17 @@ textarea::placeholder{color:#56627c}
 .warning-list{padding-left:20px;color:var(--muted);font-size:13px;line-height:1.85}
 .warning-list li::marker{color:var(--or)}
 
+.sim-table{border-collapse:collapse;margin:12px 0;font:12px var(--mono);color:#cbd6ee;width:100%;max-width:640px}
+.sim-table th,.sim-table td{border:1px solid var(--border);padding:6px 10px;text-align:left}
+.sim-table th{color:var(--bl2);font-weight:600;letter-spacing:.08em}
+.sim-ok{color:#9be3b8;font-size:13px;line-height:1.65}.sim-bad{color:#ffb7c0;font-size:13px;line-height:1.65}
+.details code{font-family:var(--mono);color:var(--or2)}
+
 @media(max-width:850px){.generator{grid-template-columns:1fr}.viewer{height:410px}}
 @media(max-width:480px){main{width:92%;margin-top:26px}.topbar{padding:0 4%}.top-label span{display:none}.viewer{height:350px}.viewer-footer button{padding:9px 10px;font-size:12px}}
 @media(prefers-reduced-motion:reduce){*,*::before,*::after{animation:none!important;transition:none!important}}
 </style>
+
 </head>
 
 <body>
@@ -231,6 +239,7 @@ textarea::placeholder{color:#56627c}
 
     {% if assembly_plan %}
     {{ assembly_plan|json_script:"assembly-plan-data" }}
+    {% if model_assets %}{{ model_assets|json_script:"model-assets-data" }}{% endif %}
 
     <section class="details">
         <h2>Device overview</h2>
@@ -240,6 +249,17 @@ textarea::placeholder{color:#56627c}
 
         <h2 style="margin-top: 24px;">Components <span class="muted">· click one to highlight it in 3D</span></h2>
         <div class="component-list" id="component-list"></div>
+
+        {% if assembly_plan.electrical %}
+        <h2 style="margin-top: 24px;">Electrical model <span class="muted">· explicit connections, never inferred from the 3D layout</span></h2>
+        <div id="electrical-summary"></div>
+        {% if simulate_url %}
+        <button class="secondary" id="sim-btn" type="button" data-url="{{ simulate_url }}" style="margin-top: 12px;">▶ Run SPICE simulation</button>
+        {% else %}
+        <p class="muted">Not simulated. Real simulation needs ngspice, <code>CIRCUITPILOT_ENABLE_SIMULATION = True</code> in settings, and a URL route named <code>cpai_simulate</code> (see the notes file).</p>
+        {% endif %}
+        <div id="sim-results" class="muted" aria-live="polite"></div>
+        {% endif %}
 
         {% if assembly_plan.assumptions %}
         <h2 style="margin-top: 24px;">Assumptions</h2>
@@ -338,6 +358,18 @@ function flat(color, options = {}) {
 
 /* ------------------------------- helpers ------------------------------- */
 
+// Level of detail: "low" halves curved-surface segments and drops text labels, "high" adds smoothness.
+// A plan component may set model_quality; otherwise the viewer picks a default from the part count.
+const QUALITY_LEVELS = { low: { scale: 0.5, labels: false }, medium: { scale: 1, labels: true }, high: { scale: 1.5, labels: true } };
+const detail = { scale: 1, labels: true };
+let defaultQuality = "medium";
+function setDefaultQuality(quality) { if (QUALITY_LEVELS[quality]) defaultQuality = quality; }
+function useQuality(quality) {
+    const level = QUALITY_LEVELS[quality] || QUALITY_LEVELS[defaultQuality];
+    detail.scale = level.scale;
+    detail.labels = level.labels;
+}
+
 const UNIT_BOX = new THREE.BoxGeometry(1, 1, 1);
 const UNIT_CYLINDER = new THREE.CylinderGeometry(1, 1, 1, 16);
 const HEX_COLOR = /^#[0-9a-fA-F]{6}$/;
@@ -364,8 +396,9 @@ function addCylinder(parent, material, radius, height, pos = [0, 0, 0], options 
         radiusBottom = radius, segments = 24, openEnded = false,
         thetaStart = 0, thetaLength = TAU, rot = null
     } = options;
+    const sides = segments <= 8 ? segments : Math.max(8, Math.round(segments * detail.scale));
     const mesh = new THREE.Mesh(
-        new THREE.CylinderGeometry(radius, radiusBottom, height, segments, 1, openEnded, thetaStart, thetaLength),
+        new THREE.CylinderGeometry(radius, radiusBottom, height, sides, 1, openEnded, thetaStart, thetaLength),
         material
     );
     mesh.position.set(pos[0], pos[1], pos[2]);
@@ -391,6 +424,50 @@ function addInstanced(parent, geometry, material, items) {
     });
     mesh.instanceMatrix.needsUpdate = true;
     mesh.frustumCulled = false;
+    parent.add(mesh);
+    return mesh;
+}
+
+// Small text labels (part numbers, pin-1 marks) drawn on a canvas. They show only text that came from the plan
+// (part_number) or a generic role such as "IC" or "SERVO"; nothing is invented. Skipped at low quality
+// or when canvas is unavailable.
+const labelTextures = new Map();
+function labelTexture(text, color) {
+    const key = `${text}|${color}`;
+    if (labelTextures.has(key)) return labelTextures.get(key);
+    let texture = null;
+    try {
+        const canvas = document.createElement("canvas");
+        const ctx = canvas.getContext ? canvas.getContext("2d") : null;
+        if (ctx) {
+            canvas.width = 256; canvas.height = 64;
+            ctx.fillStyle = color;
+            ctx.textAlign = "center"; ctx.textBaseline = "middle";
+            let size = 40;
+            ctx.font = `700 ${size}px monospace`;
+            const width = ctx.measureText(text).width;
+            if (width > 236) { size = Math.max(10, Math.floor(size * 236 / width)); ctx.font = `700 ${size}px monospace`; }
+            ctx.fillText(text, 128, 34);
+            texture = new THREE.CanvasTexture(canvas);
+            texture.colorSpace = THREE.SRGBColorSpace;
+        }
+    } catch (error) {
+        texture = null;
+    }
+    labelTextures.set(key, texture);
+    return texture;
+}
+function addLabel(parent, text, width, pos, rot, color = "#e8e8e8") {
+    if (!detail.labels || !text) return null;
+    const texture = labelTexture(String(text).slice(0, 14), color);
+    if (!texture) return null;
+    const material = new THREE.MeshBasicMaterial({
+        map: texture, transparent: true, depthWrite: false, polygonOffset: true, polygonOffsetFactor: -4, polygonOffsetUnits: -4
+    });
+    const mesh = new THREE.Mesh(new THREE.PlaneGeometry(width, width / 4), material);
+    mesh.position.set(pos[0], pos[1], pos[2]);
+    mesh.rotation.set(rot[0], rot[1], rot[2]);
+    mesh.userData.isLabel = true;
     parent.add(mesh);
     return mesh;
 }
@@ -712,11 +789,16 @@ function addMountingHoles(parent, positions, y, holeR, ringR, ringMat, holeMat) 
 
 function createPCB(component) {
     const [W, H, D] = dimsOf(component);
+    return buildPCB(W, H, D, colorOf(component, "#0b6b3a"));
+}
+
+// Bare board of thickness H (copper sits inside the box), centred on the origin.
+function buildPCB(W, H, D, boardColor) {
     const root = new THREE.Group();
     const t = Math.max(H * 0.04, Math.min(W, D) * 0.0004);                 // copper thickness
     const boardH = Math.max(H - t * 1.2, H * 0.5);                         // leave room inside the box for the raised copper
     const topY = -H / 2 + boardH;
-    addBox(root, gloss(colorOf(component, "#0b6b3a"), { roughness: 0.5, clearcoat: 0.35 }), [W, boardH, D], [0, -H / 2 + boardH / 2, 0]);
+    addBox(root, gloss(boardColor, { roughness: 0.5, clearcoat: 0.35 }), [W, boardH, D], [0, -H / 2 + boardH / 2, 0]);
 
     const copper = metal(0xc77f3e, { roughness: 0.4, metalness: 0.75, polygonOffset: true, polygonOffsetFactor: -2, polygonOffsetUnits: -2 });
     const tinned = metal(0xe0a45e, { roughness: 0.35, metalness: 0.8, polygonOffset: true, polygonOffsetFactor: -2, polygonOffsetUnits: -2 });
@@ -945,7 +1027,7 @@ function createMotor(component) {
 /* ----------------------------------- gear -------------------------------- */
 
 function extrudeFlat(shape, depth, curveSegments) {
-    const geometry = new THREE.ExtrudeGeometry(shape, { depth, bevelEnabled: false, curveSegments });
+    const geometry = new THREE.ExtrudeGeometry(shape, { depth, bevelEnabled: false, curveSegments: Math.max(4, Math.round(curveSegments * detail.scale)) });
     geometry.rotateX(-HALF_PI);                          // extrusion (+Z) becomes the Y axis
     geometry.translate(0, -depth / 2, 0);
     return geometry;
@@ -1041,9 +1123,13 @@ const COMPONENT_BUILDERS = {
     screw: createScrew, motor: createMotor, gear: createGear
 };
 
+// Adds (or replaces) the model used for a component_type.
+function registerComponentType(type, builder) { COMPONENT_BUILDERS[type] = builder; }
+
 function createDetailedComponent(component) {
     const builder = COMPONENT_BUILDERS[component.component_type];
     if (!builder) return createGenericMesh(component);   // "generic", unknown, or an old plan without component_type
+    useQuality(component.model_quality);
     try {
         return builder(component);
     } catch (error) {
@@ -1064,6 +1150,17 @@ function materialsOf(object) {
     return Array.isArray(object.material) ? object.material : [object.material];
 }
 
+function snapshotMaterial(material) {
+    claimedMaterials.add(material);
+    materialBase.set(material, {
+        opacity: material.opacity,
+        transparent: material.transparent,
+        depthWrite: material.depthWrite,
+        emissive: material.emissive ? material.emissive.clone() : null,
+        emissiveIntensity: material.emissiveIntensity === undefined ? 0 : material.emissiveIntensity
+    });
+}
+
 // Gives the component its own copies of any material another component already uses and
 // records each material's base opacity / emissive state.  Call once per built root.
 function prepareComponentMaterials(root) {
@@ -1073,14 +1170,7 @@ function prepareComponentMaterials(root) {
         const swap = m => {
             if (local.has(m)) return local.get(m);
             const own = claimedMaterials.has(m) ? m.clone() : m;
-            claimedMaterials.add(own);
-            materialBase.set(own, {
-                opacity: own.opacity,
-                transparent: own.transparent,
-                depthWrite: own.depthWrite,
-                emissive: own.emissive ? own.emissive.clone() : null,
-                emissiveIntensity: own.emissiveIntensity === undefined ? 0 : own.emissiveIntensity
-            });
+            snapshotMaterial(own);
             local.set(m, own);
             return own;
         };
@@ -1123,6 +1213,606 @@ function setRootGlow(root, amount) {
 }
 
 // ===========================================================================
+// ADDITIONAL COMPONENT MODELS
+// Same conventions as above: dimensions = full bounding box [x, y, z] in metres, model centred on the origin.
+// "Axial" parts find their long axis from the box; the others have a fixed orientation (stated per model).
+// ===========================================================================
+
+const tin = () => metal(0xc9ced4, { roughness: 0.35 });
+const goldMetal = () => metal(0xd9b24c, { roughness: 0.3 });
+const blackPlastic = (color = 0x17181c) => mat(color, { roughness: 0.55 });
+const textOf = (component, fallback) => (component.part_number ? String(component.part_number) : fallback);
+
+function leadsDown(parent, material, xs, z, y0, y1, radius) {
+    for (const x of xs) addCylinder(parent, material, radius, y1 - y0, [x, (y0 + y1) / 2, z], { segments: 8 });
+}
+
+// Flat rectangular plate (w along x, d along the shape's y) with round holes [[x, y, r], ...].
+function plateShape(w, d, holes = []) {
+    const shape = new THREE.Shape();
+    shape.moveTo(-w / 2, -d / 2);
+    shape.lineTo(w / 2, -d / 2);
+    shape.lineTo(w / 2, d / 2);
+    shape.lineTo(-w / 2, d / 2);
+    shape.closePath();
+    for (const [x, y, r] of holes) {
+        const hole = new THREE.Path();
+        hole.absarc(x, y, r, 0, TAU, true);
+        shape.holes.push(hole);
+    }
+    return shape;
+}
+
+function ringMesh(outerR, innerR, depth, material) {
+    const shape = new THREE.Shape();
+    shape.absarc(0, 0, outerR, 0, TAU, false);
+    const hole = new THREE.Path();
+    hole.absarc(0, 0, innerR, 0, TAU, true);
+    shape.holes.push(hole);
+    return new THREE.Mesh(extrudeFlat(shape, depth, 24), material);
+}
+
+// Surface of revolution from [radius, y] pairs.
+function latheMesh(points, material, segments = 40) {
+    const geometry = new THREE.LatheGeometry(points.map(([r, y]) => new THREE.Vector2(r, y)), Math.max(12, Math.round(segments * detail.scale)));
+    return new THREE.Mesh(geometry, material);
+}
+
+/* ------------------------------ ceramic capacitor ------------------------ */
+
+function createCeramicCapacitor(component) {
+    const dims = dimsOf(component);
+    const axis = longestAxisOf(dims, 1);                 // disc stands on two leads, flat face toward +Z
+    const [a, L, b] = innerDims(dims, axis);
+    const discD = Math.min(a, L * 0.7), R = discD / 2, t = Math.min(b, R * 0.8);
+    const y0 = -L / 2, cy = y0 + (L - discD) + R;
+    const inner = new THREE.Group();
+    addCylinder(inner, mat(colorOf(component, "#d9a441"), { roughness: 0.5 }), R, t, [0, cy, 0], { segments: 32, rot: [HALF_PI, 0, 0] });
+    leadsDown(inner, tin(), [-R * 0.5, R * 0.5], 0, y0, cy, R * 0.05);
+    addLabel(inner, component.part_number, R * 1.3, [0, cy, t / 2 + R * 0.004], [0, 0, 0], "#3a2a10");
+    return wrapAxial(inner, axis);
+}
+
+/* --------------------------- diode and zener diode ------------------------ */
+
+function createAxialDiode(component, zener) {
+    const dims = dimsOf(component);
+    const axis = longestAxisOf(dims, 0);                 // axial; cathode (banded end) toward +X
+    const [a, L, b] = innerDims(dims, axis);
+    const dia = Math.min(a, b), R = dia / 2;
+    const bodyLen = Math.min(dia * (zener ? 2.4 : 1.9), L * 0.6);
+    const inner = new THREE.Group();
+    addCylinder(inner, tin(), dia * 0.14, L, [0, 0, 0], { segments: 10 });
+    if (zener) {
+        const glass = new THREE.MeshPhysicalMaterial({
+            color: colorOf(component, "#d98a2b"), transparent: true, opacity: 0.78, roughness: 0.1,
+            clearcoat: 0.5, depthWrite: false
+        });
+        addCylinder(inner, glass, R * 0.92, bodyLen, [0, 0, 0], { segments: 24 });
+        const dark = mat(0x2a2a2d, { roughness: 0.5 });
+        for (const s of [-1, 1]) addCylinder(inner, dark, R * 0.8, bodyLen * 0.1, [0, s * bodyLen * 0.45, 0], { segments: 16 });
+        addCylinder(inner, metal(0xb0b4b8, { roughness: 0.4 }), R * 0.28, bodyLen * 0.5, [0, 0, 0], { segments: 12 });
+        addCylinder(inner, mat(0x111113, { roughness: 0.5 }), R * 0.95, bodyLen * 0.1, [0, bodyLen * 0.3, 0], { segments: 24 });
+    } else {
+        addCylinder(inner, mat(colorOf(component, "#1b1b1e"), { roughness: 0.5 }), R, bodyLen, [0, 0, 0], { segments: 24 });
+        addCylinder(inner, mat(0xc9ccd0, { roughness: 0.45 }), R * 1.02, bodyLen * 0.14, [0, bodyLen * 0.34, 0], { segments: 24 });
+    }
+    return wrapAxial(inner, axis);
+}
+const createDiode = component => createAxialDiode(component, false);
+const createZenerDiode = component => createAxialDiode(component, true);
+
+/* ----------------------- transistor (TO-92 style) ------------------------- */
+
+function createTransistor(component) {
+    const dims = dimsOf(component);
+    const axis = longestAxisOf(dims, 1);                 // stands along Y, flat (marked) face toward +Z
+    const [a, L, b] = innerDims(dims, axis);
+    const R = Math.min(a / 2, b), bodyH = Math.min(L * 0.36, a * 1.1);
+    const y0 = -L / 2, legLen = L - bodyH, s = Math.max(0, b - R);
+    const inner = new THREE.Group();
+
+    const shape = new THREE.Shape();                     // D-shaped section: flat edge at y = 0, round side behind it
+    shape.moveTo(-R, 0);
+    shape.lineTo(R, 0);
+    if (s > 1e-9) shape.lineTo(R, s);
+    shape.absarc(0, s, R, 0, Math.PI, false);
+    shape.closePath();
+    const geometry = extrudeFlat(shape, bodyH, 12);
+    geometry.translate(0, 0, b / 2);
+    const body = new THREE.Mesh(geometry, blackPlastic(0x18191c));
+    body.position.y = y0 + legLen + bodyH / 2;
+    inner.add(body);
+
+    const pitch = a * 0.27;
+    leadsDown(inner, tin(), [-pitch, 0, pitch], 0, y0, y0 + legLen + bodyH * 0.05, a * 0.04);
+    addLabel(inner, textOf(component, "Q"), a * 0.8, [0, body.position.y, b / 2 + a * 0.004], [0, 0, 0]);
+    return wrapAxial(inner, axis);
+}
+
+/* ------------- MOSFET and voltage regulator (TO-220 style) ---------------- */
+
+function buildTO220(component, defaultLabel) {
+    const dims = dimsOf(component);
+    const axis = longestAxisOf(dims, 1);                 // stands along Y, tab at the back (-Z), marked face toward +Z
+    const [a, L, b] = innerDims(dims, axis);
+    const y0 = -L / 2, legLen = L * 0.46, bodyH = L * 0.32, tabH = L - legLen - bodyH;
+    const tabT = b * 0.28, bodyY = y0 + legLen;
+    const inner = new THREE.Group();
+    const steel = metal(0xbfc4ca, { roughness: 0.35 });
+
+    addBox(inner, steel, [a, bodyH + tabH, tabT], [0, bodyY + (bodyH + tabH) / 2, -b / 2 + tabT / 2]);
+    addBox(inner, blackPlastic(0x18191c), [a, bodyH, b - tabT], [0, bodyY + bodyH / 2, tabT / 2]);
+    addCylinder(inner, mat(0x0b0b0d, { roughness: 0.9 }), a * 0.19, tabT * 0.2,
+        [0, bodyY + bodyH + tabH * 0.55, -b / 2 + tabT * 1.01], { segments: 20, rot: [HALF_PI, 0, 0] });
+    for (const x of [-a * 0.254, 0, a * 0.254]) {
+        addBox(inner, steel, [a * 0.06, legLen + bodyH * 0.1, b * 0.12], [x, y0 + (legLen + bodyH * 0.1) / 2, tabT / 2]);
+    }
+    addLabel(inner, textOf(component, defaultLabel), a * 0.7, [0, bodyY + bodyH * 0.5, b / 2 + b * 0.004], [0, 0, 0]);
+    return wrapAxial(inner, axis);
+}
+const createMOSFET = component => buildTO220(component, "FET");
+const createVoltageRegulator = component => buildTO220(component, "REG");
+
+/* ----------------------------- DIP integrated circuit --------------------- */
+
+function createIC(component) {
+    const [W, H, D] = dimsOf(component);                 // row of pins along X, stands on its legs, pin 1 at -X
+    const root = new THREE.Group();
+    const pitch = Math.min(0.00254, W * 0.3);
+    const n = clamp(Math.floor((W + pitch * 0.3) / pitch), 2, 24);
+    const bodyW = D * 0.8, bodyH = H * 0.47, y0 = -H / 2;
+    const bodyY = y0 + H - bodyH / 2, topY = bodyY + bodyH / 2;
+    addBox(root, blackPlastic(0x1b1c20), [W, bodyH, bodyW], [0, bodyY, 0]);
+
+    const pinW = pitch * 0.2, pinT = pitch * 0.1;
+    const shoulderY = bodyY - bodyH * 0.1, legH = shoulderY - y0 + pinT / 2;
+    const shoulderLen = (D - bodyW) / 2 + pinT * 0.5;
+    const shoulders = [], legs = [];
+    for (const sz of [-1, 1]) {
+        for (let i = 0; i < n; i++) {
+            const x = (i - (n - 1) / 2) * pitch;
+            shoulders.push({ pos: [x, shoulderY, sz * (bodyW / 2 + shoulderLen / 2 - pinT * 0.5)], scale: [pinW, pinT, shoulderLen] });
+            legs.push({ pos: [x, y0 + legH / 2, sz * (D / 2 - pinT / 2)], scale: [pinW, legH, pinT] });
+        }
+    }
+    const pinMat = tin();
+    addInstanced(root, UNIT_BOX, pinMat, shoulders);
+    addInstanced(root, UNIT_BOX, pinMat, legs);
+
+    addCylinder(root, mat(0x050506, { roughness: 0.9 }), bodyW * 0.14, bodyH * 0.02, [-W / 2, topY, 0],
+        { segments: 20, thetaStart: 0, thetaLength: Math.PI });               // notch marks the pin-1 end
+    addCylinder(root, mat(0xcfd2d6, { roughness: 0.8 }), bodyW * 0.05, bodyH * 0.02, [-W / 2 + W * 0.1, topY, -bodyW / 2 + bodyW * 0.2], { segments: 12 });
+    addLabel(root, textOf(component, "IC"), W * 0.6, [W * 0.04, topY + bodyH * 0.004, 0], [-HALF_PI, 0, 0]);
+    return root;
+}
+
+/* --------------------- push button, switch, potentiometer ----------------- */
+
+function createPushButton(component) {
+    const [W, H, D] = dimsOf(component);                 // 6 mm tactile switch, cap up
+    const root = new THREE.Group();
+    const y0 = -H / 2, legH = H * 0.38, bodyH = H * 0.33, capH = H - legH - bodyH;
+    const bodyTop = y0 + legH + bodyH;
+    addBox(root, blackPlastic(0x1b1c20), [W, bodyH, D], [0, y0 + legH + bodyH / 2, 0]);
+    addBox(root, metal(0xbfc4ca, { roughness: 0.35 }), [W * 0.94, bodyH * 0.1, D * 0.94], [0, bodyTop - bodyH * 0.05, 0]);
+    addCylinder(root, mat(colorOf(component, "#c0392b"), { roughness: 0.5 }), Math.min(W, D) * 0.3, capH, [0, bodyTop + capH / 2, 0], { segments: 24 });
+    const pin = tin();
+    for (const sx of [-1, 1]) for (const sz of [-1, 1]) {
+        addBox(root, pin, [W * 0.08, legH + bodyH * 0.2, D * 0.1], [sx * (W / 2 - W * 0.05), y0 + (legH + bodyH * 0.2) / 2, sz * D * 0.3]);
+    }
+    return root;
+}
+
+function createSwitch(component) {
+    const [W, H, D] = dimsOf(component);                 // slide switch, knob up
+    const root = new THREE.Group();
+    const y0 = -H / 2, legH = H * 0.3, bodyH = H * 0.34, knobH = H - legH - bodyH;
+    const bodyTop = y0 + legH + bodyH;
+    addBox(root, metal(0xb8bec5, { roughness: 0.4 }), [W, bodyH, D], [0, y0 + legH + bodyH / 2, 0]);
+    addBox(root, mat(0x0a0a0c, { roughness: 0.8 }), [W * 0.62, bodyH * 0.04, D * 0.3], [0, bodyTop, 0]);
+    addBox(root, blackPlastic(0x202226), [W * 0.26, knobH, D * 0.55], [W * 0.14, bodyTop + knobH / 2 - bodyH * 0.02, 0]);
+    const pin = tin();
+    for (const x of [-W * 0.28, 0, W * 0.28]) addBox(root, pin, [W * 0.08, legH + bodyH * 0.1, D * 0.2], [x, y0 + (legH + bodyH * 0.1) / 2, 0]);
+    return root;
+}
+
+function createPotentiometer(component) {
+    const [W, H, D] = dimsOf(component);                 // rotary potentiometer: shaft and knob up, pins down
+    const root = new THREE.Group();
+    const R = Math.min(W, D) / 2, y0 = -H / 2;
+    const legH = H * 0.14, bodyH = H * 0.26, bushH = H * 0.12, upH = H - legH - bodyH - bushH;
+    const bodyTop = y0 + legH + bodyH, bushTop = bodyTop + bushH;
+    const steel = metal(0xb4bac1, { roughness: 0.35 });
+    addCylinder(root, metal(colorOf(component, "#a7adb5"), { roughness: 0.5, metalness: 0.6 }), R, bodyH, [0, y0 + legH + bodyH / 2, 0], { segments: 32 });
+    addCylinder(root, steel, R * 0.42, bushH, [0, bodyTop + bushH / 2, 0], { segments: 20 });
+    const shaftH = upH * 0.45, knobH = upH - shaftH;
+    addCylinder(root, steel, R * 0.22, shaftH + knobH * 0.2, [0, bushTop + (shaftH + knobH * 0.2) / 2, 0], { segments: 14 });
+    const knobY = bushTop + shaftH + knobH / 2;
+    addCylinder(root, blackPlastic(0x1c1d21), R * 0.68, knobH, [0, knobY, 0], { segments: 32 });
+    addBox(root, mat(0xf2f2f2, { roughness: 0.6 }), [R * 0.06, knobH * 0.04, R * 0.5], [0, knobY + knobH / 2, -R * 0.34]);
+    const pin = tin();
+    for (const x of [-R * 0.5, 0, R * 0.5]) addBox(root, pin, [R * 0.1, legH + bodyH * 0.1, R * 0.06], [x, y0 + (legH + bodyH * 0.1) / 2, R * 0.55]);
+    return root;
+}
+
+/* ---------------------------- connectors ---------------------------------- */
+
+function createHeader(component) {
+    const [W, H, D] = dimsOf(component);                 // single row of pins along X, pins vertical
+    const root = new THREE.Group();
+    const n = clamp(Math.round(W / 0.00254), 1, 40), pitch = W / n;
+    const y0 = -H / 2, baseH = H * 0.22;
+    addBox(root, blackPlastic(0x1d1e22), [W, baseH, D], [0, y0 + H * 0.3 + baseH / 2, 0]);
+    const pinW = Math.min(D * 0.4, pitch * 0.25), pins = [];
+    for (let i = 0; i < n; i++) pins.push({ pos: [(i - (n - 1) / 2) * pitch, 0, 0], scale: [pinW, H, pinW] });
+    addInstanced(root, UNIT_BOX, goldMetal(), pins);
+    return root;
+}
+
+function createUSBConnector(component) {
+    const [W, H, D] = dimsOf(component);                 // receptacle: opening toward -X, solder tabs below
+    const root = new THREE.Group();
+    const y0 = -H / 2, legH = H * 0.1, shellH = H - legH, shellY = y0 + legH + shellH / 2;
+    const tw = Math.min(shellH, D) * 0.06, steel = metal(0xb9bec5, { roughness: 0.3 });
+    addBox(root, steel, [W, tw, D], [0, shellY + shellH / 2 - tw / 2, 0]);
+    addBox(root, steel, [W, tw, D], [0, shellY - shellH / 2 + tw / 2, 0]);
+    for (const sz of [-1, 1]) addBox(root, steel, [W, shellH - 2 * tw, tw], [0, shellY, sz * (D / 2 - tw / 2)]);
+    addBox(root, mat(0x050506, { roughness: 0.9 }), [tw, shellH - 2 * tw, D - 2 * tw], [W / 2 - tw / 2, shellY, 0]);
+    addBox(root, mat(colorOf(component, "#e9e9ec"), { roughness: 0.6 }), [W * 0.62, shellH * 0.2, D * 0.68], [W / 2 - tw - W * 0.31, shellY, 0]);
+    for (const sx of [-1, 1]) for (const sz of [-1, 1]) {
+        addBox(root, steel, [W * 0.06, legH * 1.2, D * 0.06], [sx * W * 0.35, y0 + legH * 0.5, sz * D * 0.4]);
+    }
+    return root;
+}
+
+function createTerminalBlock(component) {
+    const [W, H, D] = dimsOf(component);                 // screw terminal block, wire entries toward +Z
+    const root = new THREE.Group();
+    const n = Math.max(1, Math.round(W / 0.005)), pitch = W / n;
+    const y0 = -H / 2, legH = H * 0.18, screwH = H * 0.05, bodyH = H - legH - screwH, bodyTop = y0 + legH + bodyH;
+    addBox(root, mat(colorOf(component, "#2b6cb0"), { roughness: 0.5 }), [W, bodyH, D], [0, y0 + legH + bodyH / 2, 0]);
+    const screwMat = metal(0xc3c8ce, { roughness: 0.4 }), dark = mat(0x0b0b0d, { roughness: 0.9 }), pin = tin();
+    const r = Math.min(pitch * 0.3, D * 0.3);
+    for (let i = 0; i < n; i++) {
+        const x = (i - (n - 1) / 2) * pitch;
+        addCylinder(root, screwMat, r, screwH, [x, bodyTop + screwH / 2, 0], { segments: 20 });
+        addBox(root, dark, [r * 1.5, screwH * 0.3, r * 0.25], [x, bodyTop + screwH * 0.9, 0]);
+        addBox(root, dark, [pitch * 0.6, bodyH * 0.38, D * 0.03], [x, y0 + legH + bodyH * 0.45, D / 2 - D * 0.012]);
+        addBox(root, pin, [pitch * 0.1, legH + bodyH * 0.1, D * 0.14], [x, y0 + (legH + bodyH * 0.1) / 2, 0]);
+    }
+    return root;
+}
+
+/* ------------------- development board and populated PCB ----------------- */
+
+function createDevelopmentBoard(component) {
+    const [W, H, D] = dimsOf(component);                 // module-style board: USB at -X, pin headers along both long edges
+    const root = new THREE.Group();
+    const pcbT = Math.min(H * 0.2, D * 0.05), hAvail = Math.max(H - pcbT, 1e-6), yTop = -H / 2 + pcbT;
+    addBox(root, gloss(colorOf(component, "#1f7a3d"), { roughness: 0.5, clearcoat: 0.35 }), [W, pcbT, D], [0, -H / 2 + pcbT / 2, 0]);
+    const sit = (material, size, x, z) => addBox(root, material, size, [x, yTop + size[1] / 2, z]);
+
+    const pH = Math.min(0.00254, D * 0.12), n = clamp(Math.floor((W * 0.85) / pH), 4, 24), pinW = pH * 0.22;
+    const pins = [];
+    for (const sz of [-1, 1]) {
+        const z = sz * (D / 2 - pH * 0.75);
+        sit(blackPlastic(0x1d1e22), [n * pH, hAvail * 0.3, pH], 0.02 * W, z);
+        for (let i = 0; i < n; i++) pins.push({ pos: [0.02 * W + (i - (n - 1) / 2) * pH, yTop + hAvail / 2, z], scale: [pinW, hAvail, pinW] });
+    }
+    addInstanced(root, UNIT_BOX, goldMetal(), pins);
+
+    const steel = metal(0xbcc1c7, { roughness: 0.3 });
+    sit(steel, [W * 0.3, hAvail * 0.2, D * 0.4], W * 0.22, 0);                                   // RF shield / module
+    sit(blackPlastic(0x15161a), [W * 0.12, hAvail * 0.1, Math.min(W * 0.12, D * 0.34)], -W * 0.08, 0);
+    sit(steel, [W * 0.1, hAvail * 0.3, D * 0.3], -W / 2 + W * 0.05, 0);                         // micro-USB shell
+    addBox(root, mat(0x050506, { roughness: 0.9 }), [W * 0.006, hAvail * 0.14, D * 0.2], [-W / 2 + W * 0.002, yTop + hAvail * 0.15, 0]);
+    sit(mat(0xe8e8ea, { roughness: 0.5 }), [W * 0.05, hAvail * 0.14, D * 0.15], -W * 0.26, D * 0.1);
+    sit(mat(0x27ae60, { roughness: 0.4 }), [W * 0.02, hAvail * 0.05, D * 0.05], -W * 0.18, -D * 0.2);
+
+    const holeR = Math.min(W, D) * 0.02, inset = D * 0.07;
+    const copper = metal(0xc77f3e, { roughness: 0.4, polygonOffset: true, polygonOffsetFactor: -2, polygonOffsetUnits: -2 });
+    addMountingHoles(root, [[-1, -1], [-1, 1], [1, -1], [1, 1]].map(([sx, sz]) => [sx * (W / 2 - inset), sz * (D / 2 - inset)]),
+        yTop + pcbT * 0.02, holeR, holeR * 1.8, copper, flat(0x15161a, { roughness: 0.8 }));
+    return root;
+}
+
+function createPCBAssembly(component) {
+    const [W, H, D] = dimsOf(component);                 // populated board: chip, header, capacitor, SMD parts
+    const root = new THREE.Group();
+    const pcbT = Math.min(H * 0.25, Math.min(W, D) * 0.03), hAvail = Math.max(H - pcbT, 1e-6), yTop = -H / 2 + pcbT;
+    const board = buildPCB(W, pcbT, D, colorOf(component, "#0b6b3a"));
+    board.position.y = -H / 2 + pcbT / 2;
+    root.add(board);
+    const sit = (material, size, x, z) => addBox(root, material, size, [x, yTop + size[1] / 2, z]);
+    const black = blackPlastic(0x15161a), steel = metal(0xbcc1c7, { roughness: 0.3 });
+
+    // Surface-mount IC with gull-wing pins on all four sides.
+    const chipS = Math.min(W, D) * 0.26, chipX = W * 0.1, chipH = hAvail * 0.14;
+    sit(black, [chipS, chipH, chipS], chipX, 0);
+    const k = 10, pitch = chipS / k, gull = [];
+    for (let i = 0; i < k; i++) {
+        const o = (i - (k - 1) / 2) * pitch, e = chipS / 2 + pitch * 0.35;
+        gull.push({ pos: [chipX + o, yTop + chipH * 0.3, e], scale: [pitch * 0.4, chipH * 0.15, pitch * 0.9] });
+        gull.push({ pos: [chipX + o, yTop + chipH * 0.3, -e], scale: [pitch * 0.4, chipH * 0.15, pitch * 0.9] });
+        gull.push({ pos: [chipX + e, yTop + chipH * 0.3, o], scale: [pitch * 0.9, chipH * 0.15, pitch * 0.4] });
+        gull.push({ pos: [chipX - e, yTop + chipH * 0.3, o], scale: [pitch * 0.9, chipH * 0.15, pitch * 0.4] });
+    }
+    addInstanced(root, UNIT_BOX, steel, gull);
+    addLabel(root, textOf(component, "IC"), chipS * 0.8, [chipX, yTop + chipH + chipH * 0.01, 0], [-HALF_PI, 0, 0]);
+
+    // Header along the +Z edge.
+    const pH = Math.min(0.00254, D * 0.05), nH = clamp(Math.floor((W * 0.6) / pH), 4, 20), hz = D / 2 - pH * 0.9;
+    sit(blackPlastic(0x1d1e22), [nH * pH, hAvail * 0.4, pH], -W * 0.1, hz);
+    const hp = [];
+    for (let i = 0; i < nH; i++) hp.push({ pos: [-W * 0.1 + (i - (nH - 1) / 2) * pH, yTop + hAvail / 2, hz], scale: [pH * 0.22, hAvail, pH * 0.22] });
+    addInstanced(root, UNIT_BOX, goldMetal(), hp);
+
+    // Electrolytic capacitor, crystal, and a row of small SMD resistors and capacitors.
+    const r = Math.min(W, D) * 0.07, ch = hAvail * 0.55;
+    addCylinder(root, mat(0x1c1c22, { roughness: 0.5 }), r, ch, [-W * 0.33, yTop + ch / 2, -D * 0.15], { segments: 24 });
+    addCylinder(root, steel, r * 0.96, ch * 0.04, [-W * 0.33, yTop + ch, -D * 0.15], { segments: 24 });
+    sit(steel, [W * 0.06, hAvail * 0.18, D * 0.04], W * 0.36, -D * 0.12);
+    const smd = [];
+    for (let i = 0; i < 8; i++) smd.push({ pos: [-W * 0.12 + i * W * 0.035, yTop + hAvail * 0.025, -D * 0.34], scale: [W * 0.025, hAvail * 0.05, D * 0.025] });
+    addInstanced(root, UNIT_BOX, mat(0x1a1a1a, { roughness: 0.5 }), smd.filter((_, i) => i % 2 === 0));
+    addInstanced(root, UNIT_BOX, mat(0xb08a54, { roughness: 0.6 }), smd.filter((_, i) => i % 2 === 1));
+    sit(mat(0xc0392b, { roughness: 0.4 }), [D * 0.025, hAvail * 0.06, D * 0.04], W * 0.36, D * 0.15);
+    sit(mat(0x27ae60, { roughness: 0.4 }), [D * 0.025, hAvail * 0.06, D * 0.04], W * 0.36, D * 0.22);
+    return root;
+}
+
+/* --------------------------- mechanical parts ------------------------------ */
+
+function createServo(component) {
+    const [a, H, b] = dimsOf(component);                 // hobby servo: length along X, output shaft and horn up (+Y), cable out of -X
+    const root = new THREE.Group();
+    const y0 = -H / 2, bodyL = a * 0.69, bodyH = H * 0.66, bodyTop = y0 + bodyH, shaftX = a * 0.155;
+    const body = mat(colorOf(component, "#2a63c7"), { roughness: 0.5 }), white = mat(0xececec, { roughness: 0.5 });
+    addBox(root, body, [bodyL, bodyH, b], [0, y0 + bodyH / 2, 0]);
+    const earT = H * 0.06;
+    addBox(root, body, [a, earT, b * 0.98], [0, y0 + H * 0.42, 0]);
+    const hole = mat(0x050506, { roughness: 0.9 });
+    for (const s of [-1, 1]) addCylinder(root, hole, b * 0.1, earT * 0.1, [s * (a / 2 - a * 0.07), y0 + H * 0.42 + earT / 2, 0], { segments: 12 });
+    addCylinder(root, body, b * 0.45, H * 0.07, [shaftX, bodyTop + H * 0.035, 0], { segments: 28 });      // gearbox bumps
+    addCylinder(root, body, b * 0.25, H * 0.05, [shaftX - b * 0.55, bodyTop + H * 0.025, 0], { segments: 20 });
+    const shaftBottom = bodyTop + H * 0.07, shaftTop = H * 0.46;
+    addCylinder(root, metal(0xd0d4d8, { roughness: 0.35 }), b * 0.13, shaftTop - shaftBottom, [shaftX, (shaftBottom + shaftTop) / 2, 0], { segments: 14 });
+    addCylinder(root, white, b * 0.25, H * 0.06, [shaftX, H * 0.47, 0], { segments: 20 });             // horn hub
+    addBox(root, white, [a * 0.4, H * 0.035, b * 0.2], [shaftX, H * 0.4825, 0]);                       // horn arm
+    [["#5a3a22", -1], ["#c0392b", 0], ["#e67e22", 1]].forEach(([color, i]) => {                        // three-wire cable
+        addCylinder(root, mat(color, { roughness: 0.6 }), b * 0.04, a / 2 - bodyL / 2, [-bodyL / 2 - (a / 2 - bodyL / 2) / 2, y0 + bodyH * 0.28, i * b * 0.12], { segments: 8, rot: [0, 0, HALF_PI] });
+    });
+    addLabel(root, textOf(component, "SERVO"), bodyL * 0.6, [0, y0 + bodyH * 0.6, b / 2 + b * 0.004], [0, 0, 0], "#ffffff");
+    return root;
+}
+
+function createShaft(component) {
+    const dims = dimsOf(component);
+    const axis = longestAxisOf(dims, 1);
+    const [a, L, b] = innerDims(dims, axis);
+    const R = Math.min(a, b) / 2, c = Math.min(R * 0.12, L * 0.1);
+    const inner = new THREE.Group();
+    const steel = metal(colorOf(component, "#c3c8ce"), { roughness: 0.3 });
+    addCylinder(inner, steel, R, L - 2 * c, [0, 0, 0], { segments: 32 });
+    addCylinder(inner, steel, R * 0.88, c, [0, L / 2 - c / 2, 0], { radiusBottom: R, segments: 32 });
+    addCylinder(inner, steel, R * 0.88, c, [0, -L / 2 + c / 2, 0], { radiusBottom: R, segments: 32, rot: [Math.PI, 0, 0] });
+    addBox(inner, mat(0x2a2d31, { roughness: 0.7 }), [R * 0.3, L * 0.2, R * 0.3], [0, L * 0.3, R * 0.85]);      // keyway flat
+    addCylinder(inner, mat(0x3a3d42, { roughness: 0.6 }), R * 1.001, L * 0.02, [0, -L * 0.3, 0], { segments: 32 }); // retaining-ring groove
+    return wrapAxial(inner, axis);
+}
+
+function createBearing(component) {
+    const dims = dimsOf(component);
+    const axis = shortestAxisOf(dims, 1);                // ball bearing: axis is the thin direction
+    const [a, T, b] = innerDims(dims, axis);
+    const Ro = Math.min(a, b) / 2;
+    const inner = new THREE.Group();
+    const steel = metal(colorOf(component, "#b8bec5"), { roughness: 0.28 });
+    inner.add(ringMesh(Ro, Ro * 0.78, T, steel));                                       // outer race
+    inner.add(ringMesh(Ro * 0.62, Ro * 0.34, T, steel));                                // inner race
+    inner.add(ringMesh(Ro * 0.78, Ro * 0.62, T * 0.7, mat(0x2a2c30, { roughness: 0.6 })));   // recessed shield
+    return wrapAxial(inner, axis);
+}
+
+function createNut(component) {
+    const dims = dimsOf(component);
+    const axis = shortestAxisOf(dims, 1);                // hex nut: axis is the thin direction
+    const [a, T, b] = innerDims(dims, axis);
+    const Rc = Math.min(a / 2, b / 1.7321);
+    const hex = new THREE.Shape();
+    for (let i = 0; i < 6; i++) {
+        const angle = i * Math.PI / 3;
+        if (i === 0) hex.moveTo(Math.cos(angle) * Rc, Math.sin(angle) * Rc);
+        else hex.lineTo(Math.cos(angle) * Rc, Math.sin(angle) * Rc);
+    }
+    hex.closePath();
+    const bore = new THREE.Path();
+    bore.absarc(0, 0, Rc * 0.5, 0, TAU, true);
+    hex.holes.push(bore);
+    const steel = metal(colorOf(component, "#9aa0a6"), { roughness: 0.4 });
+    const inner = new THREE.Group();
+    inner.add(new THREE.Mesh(extrudeFlat(hex, T * 0.94, 8), steel));
+    for (const s of [-1, 1]) {
+        const face = ringMesh(Rc * 0.86, Rc * 0.5, T * 0.04, metal(0xc4c9ce, { roughness: 0.3 }));
+        face.position.y = s * (T / 2 - T * 0.02);
+        inner.add(face);
+    }
+    return wrapAxial(inner, axis);
+}
+
+function createBracket(component) {
+    const [W, H, D] = dimsOf(component);                 // L-bracket: base plate along X, upright plate at -X
+    const root = new THREE.Group();
+    const t = Math.min(W, H) * 0.12;
+    const steel = metal(colorOf(component, "#8e959c"), { roughness: 0.45 });
+    const baseHoles = [-1, 1].map(s => [s * W * 0.25, 0, Math.min(D * 0.2, W * 0.08)]);
+    const base = new THREE.Mesh(extrudeFlat(plateShape(W, D, baseHoles), t, 12), steel);
+    base.position.y = -H / 2 + t / 2;
+    root.add(base);
+    const upHoles = [-1, 1].map(s => [s * H * 0.25, 0, Math.min(D * 0.2, H * 0.08)]);
+    const upright = new THREE.Mesh(extrudeFlat(plateShape(H, D, upHoles), t, 12), steel);
+    upright.rotation.z = HALF_PI;                        // plate length -> Y, thickness -> X
+    upright.position.set(-W / 2 + t / 2, 0, 0);
+    root.add(upright);
+    return root;
+}
+
+function createFan(component) {
+    const dims = dimsOf(component);
+    const axis = shortestAxisOf(dims, 1);                // square cooling fan: axis is the thin direction
+    const [a, T, b] = innerDims(dims, axis);
+    const S = Math.min(a, b), open = S * 0.46;
+    const inner = new THREE.Group();
+    const corner = S * 0.42, holes = [[-corner, -corner], [corner, -corner], [-corner, corner], [corner, corner]].map(([x, y]) => [x, y, S * 0.035]);
+    const shape = plateShape(S, S, holes);
+    const opening = new THREE.Path();
+    opening.absarc(0, 0, open, 0, TAU, true);
+    shape.holes.push(opening);
+    inner.add(new THREE.Mesh(extrudeFlat(shape, T, 24), mat(colorOf(component, "#202226"), { roughness: 0.55 })));
+
+    const hubR = S * 0.17, bladeMat = mat(0x34363b, { roughness: 0.5 });
+    addCylinder(inner, blackPlastic(0x15161a), hubR, T * 0.85, [0, 0, 0], { segments: 24 });
+    const nBlades = 7, bladeLen = open * 0.96 - hubR * 0.9, chord = S * 0.17, thick = T * 0.07;
+    const tilt = Math.min(0.5, Math.asin(Math.min(1, Math.max(0, (T * 0.7 - thick) / chord))));
+    for (let i = 0; i < nBlades; i++) {
+        const group = new THREE.Group();
+        group.rotation.y = i * TAU / nBlades;
+        addBox(group, bladeMat, [bladeLen, thick, chord], [hubR * 0.9 + bladeLen / 2, 0, 0], [tilt, 0, 0]);
+        inner.add(group);
+    }
+    return wrapAxial(inner, axis);
+}
+
+function createPulley(component) {
+    const dims = dimsOf(component);
+    const axis = shortestAxisOf(dims, 1);                // V-groove pulley: axis is the thin direction
+    const [a, W, b] = innerDims(dims, axis);
+    const R = Math.min(a, b) / 2, boreR = R * 0.16, grooveR = R * 0.72;
+    const fT = W * 0.18, g = W * 0.06, y1 = -W / 2, y4 = W / 2;
+    const inner = new THREE.Group();
+    inner.add(latheMesh([
+        [boreR, y1], [R, y1], [R, y1 + fT], [grooveR, -g], [grooveR, g], [R, y4 - fT], [R, y4], [boreR, y4], [boreR, y1]
+    ], metal(colorOf(component, "#a9afb7"), { roughness: 0.4, metalness: 0.7 }), 48));
+    return wrapAxial(inner, axis);
+}
+
+function createSpeaker(component) {
+    const dims = dimsOf(component);
+    const axis = shortestAxisOf(dims, 1);                // round speaker: axis is the thin direction, cone faces +axis
+    const [a, H, b] = innerDims(dims, axis);
+    const R = Math.min(a, b) / 2, y0 = -H / 2;
+    const inner = new THREE.Group();
+    const darkMetal = metal(0x2b2d31, { roughness: 0.5 });
+    const coneMat = mat(0x2b2b2e, { roughness: 0.7, side: THREE.DoubleSide });
+    addCylinder(inner, darkMetal, R * 0.5, H * 0.38, [0, y0 + H * 0.19, 0], { segments: 32 });             // magnet
+    inner.add(latheMesh([[R * 0.55, y0 + H * 0.3], [R * 0.92, H / 2 - H * 0.1]], metal(0x1d1e21, { roughness: 0.55, side: THREE.DoubleSide }), 32));   // basket
+    inner.add(latheMesh([[R * 0.2, y0 + H * 0.45], [R * 0.8, H / 2 - H * 0.14]], coneMat, 40));            // paper cone
+    const capR = R * 0.2, capY = y0 + H * 0.45;
+    const cap = [];
+    for (let i = 0; i <= 6; i++) { const t = (i / 6) * HALF_PI; cap.push([Math.max(Math.cos(t) * capR, 0.00001), capY + Math.sin(t) * capR * 0.7]); }
+    inner.add(latheMesh(cap, mat(0x1c1c1f, { roughness: 0.6, side: THREE.DoubleSide }), 24));            // dust cap
+    inner.add(ringMesh(R, R * 0.9, H * 0.1, darkMetal));
+    inner.children[inner.children.length - 1].position.y = H / 2 - H * 0.05;
+    const tube = Math.min(R * 0.05, H * 0.04);
+    const surround = new THREE.Mesh(new THREE.TorusGeometry(R * 0.84, tube, 10, 40), mat(0x111113, { roughness: 0.8 }));
+    surround.geometry.rotateX(-HALF_PI);
+    surround.position.y = H / 2 - H * 0.14;
+    inner.add(surround);
+    for (const s of [-1, 1]) addBox(inner, tin(), [R * 0.12, H * 0.05, R * 0.2], [s * R * 0.62, y0 + H * 0.3, 0]);   // terminals
+    return wrapAxial(inner, axis);
+}
+
+function createBuzzer(component) {
+    const dims = dimsOf(component);
+    const axis = shortestAxisOf(dims, 1);                // round buzzer: axis is the thin direction, sound port toward +axis
+    const [a, H, b] = innerDims(dims, axis);
+    const R = Math.min(a, b) / 2, y0 = -H / 2, bodyH = H * 0.62, legH = H - bodyH;
+    const inner = new THREE.Group();
+    addCylinder(inner, blackPlastic(colorOf(component, "#17181c")), R, bodyH, [0, y0 + legH + bodyH / 2, 0], { segments: 32 });
+    addCylinder(inner, mat(0x050506, { roughness: 0.9 }), R * 0.14, bodyH * 0.02, [0, y0 + H, 0], { segments: 14 });
+    const white = mat(0xf2f2f2, { roughness: 0.6 });
+    addBox(inner, white, [R * 0.22, bodyH * 0.02, R * 0.05], [R * 0.6, y0 + H - bodyH * 0.005, 0]);        // "+" mark
+    addBox(inner, white, [R * 0.05, bodyH * 0.02, R * 0.22], [R * 0.6, y0 + H - bodyH * 0.005, 0]);
+    leadsDown(inner, tin(), [-R * 0.63, R * 0.63], 0, y0, y0 + legH + bodyH * 0.1, R * 0.05);
+    return wrapAxial(inner, axis);
+}
+
+/* -------------------------------- sensor ----------------------------------- */
+
+// Chooses a recognisable sensing element from the part's name / function / electrical_properties.sensor_type.
+function sensorKind(component) {
+    const props = component.electrical_properties || {};
+    const text = `${component.name || ""} ${component.function || ""} ${props.sensor_type || ""}`.toLowerCase();
+    if (/ultrason|sonar|distance|hc-?sr/.test(text)) return "ultrasonic";
+    if (/\bpir\b|motion/.test(text)) return "pir";
+    if (/temperature|humidity|dht|thermist/.test(text)) return "climate";
+    if (/light|ldr|photo/.test(text)) return "light";
+    return "generic";
+}
+
+function createSensor(component) {
+    const [W, H, D] = dimsOf(component);                 // small breakout module: pin header along the -X edge
+    const root = new THREE.Group();
+    const pcbT = Math.min(H * 0.18, D * 0.05), hAvail = Math.max(H - pcbT, 1e-6), yTop = -H / 2 + pcbT;
+    addBox(root, gloss(colorOf(component, "#1a5fb4"), { roughness: 0.5, clearcoat: 0.3 }), [W, pcbT, D], [0, -H / 2 + pcbT / 2, 0]);
+    const sit = (material, size, x, z) => addBox(root, material, size, [x, yTop + size[1] / 2, z]);
+    const steel = metal(0xbcc1c7, { roughness: 0.3 }), black = blackPlastic(0x15161a);
+
+    const pH = Math.min(0.00254, D * 0.12), nP = clamp(Math.floor((D * 0.8) / pH), 2, 6), hx = -W / 2 + pH * 0.9;
+    sit(blackPlastic(0x1d1e22), [pH, hAvail * 0.25, nP * pH], hx, 0);
+    const pins = [];
+    for (let i = 0; i < nP; i++) pins.push({ pos: [hx, yTop + hAvail * 0.4, (i - (nP - 1) / 2) * pH], scale: [pH * 0.22, hAvail * 0.8, pH * 0.22] });
+    addInstanced(root, UNIT_BOX, goldMetal(), pins);
+
+    const kind = sensorKind(component), cx = W * 0.12;
+    if (kind === "ultrasonic") {
+        const r = Math.min(D * 0.24, W * 0.18), h = hAvail * 0.75, off = D / 2 - r;
+        for (const sz of [-1, 1]) {
+            addCylinder(root, steel, r, h, [cx, yTop + h / 2, sz * off], { segments: 28 });
+            addCylinder(root, mat(0x0c0c0e, { roughness: 0.8 }), r * 0.8, h * 0.03, [cx, yTop + h, sz * off], { segments: 24 });
+        }
+        sit(steel, [W * 0.08, hAvail * 0.2, D * 0.06], cx + W * 0.3, 0);
+    } else if (kind === "pir") {
+        const r = Math.min(W, D) * 0.34;
+        addCylinder(root, black, r, hAvail * 0.25, [cx, yTop + hAvail * 0.125, 0], { segments: 28 });
+        const dome = [];
+        for (let i = 0; i <= 8; i++) { const t = (i / 8) * HALF_PI; dome.push([Math.max(Math.cos(t) * r * 0.95, 0.00001), yTop + hAvail * 0.25 + Math.sin(t) * (hAvail * 0.7)]); }
+        root.add(latheMesh(dome, mat(0xf4f4f0, { roughness: 0.4 }), 28));
+    } else if (kind === "climate") {
+        sit(mat(0x2f7fd1, { roughness: 0.5 }), [W * 0.55, hAvail * 0.85, D * 0.7], cx + W * 0.1, 0);
+        const slots = [];
+        for (let i = 0; i < 5; i++) for (let j = 0; j < 4; j++) {
+            slots.push({ pos: [cx + W * 0.1 + (i - 2) * W * 0.09, yTop + hAvail * 0.85, (j - 1.5) * D * 0.14], scale: [W * 0.04, hAvail * 0.02, D * 0.07] });
+        }
+        addInstanced(root, UNIT_BOX, mat(0x0a1a2c, { roughness: 0.9 }), slots);
+    } else if (kind === "light") {
+        const r = Math.min(W, D) * 0.2;
+        addCylinder(root, mat(0xc89b5a, { roughness: 0.5 }), r, hAvail * 0.2, [cx, yTop + hAvail * 0.1, -D * 0.15], { segments: 24 });
+        addCylinder(root, mat(0x5a3a1c, { roughness: 0.6 }), r * 0.75, hAvail * 0.01, [cx, yTop + hAvail * 0.2, -D * 0.15], { segments: 24 });
+        sit(black, [W * 0.14, hAvail * 0.12, D * 0.14], cx + W * 0.22, D * 0.18);
+    } else {
+        sit(black, [W * 0.2, hAvail * 0.12, D * 0.3], cx, 0);
+        addCylinder(root, steel, Math.min(W, D) * 0.12, hAvail * 0.4, [cx + W * 0.3, yTop + hAvail * 0.2, 0], { segments: 20 });
+    }
+    addLabel(root, component.part_number, W * 0.35, [W * 0.3, yTop + hAvail * 0.002, D * 0.36], [-HALF_PI, 0, 0]);
+    return root;
+}
+
+/* -------------------------------- registry --------------------------------- */
+
+const ADDITIONAL_BUILDERS = {
+    ceramic_capacitor: createCeramicCapacitor, diode: createDiode, zener_diode: createZenerDiode,
+    transistor: createTransistor, mosfet: createMOSFET, voltage_regulator: createVoltageRegulator, ic: createIC,
+    push_button: createPushButton, switch: createSwitch, potentiometer: createPotentiometer,
+    header: createHeader, usb_connector: createUSBConnector, connector: createTerminalBlock,
+    development_board: createDevelopmentBoard, pcb_assembly: createPCBAssembly,
+    servo: createServo, shaft: createShaft, bearing: createBearing, nut: createNut, bracket: createBracket,
+    fan: createFan, pulley: createPulley, speaker: createSpeaker, buzzer: createBuzzer, sensor: createSensor
+};
+for (const [type, builder] of Object.entries(ADDITIONAL_BUILDERS)) registerComponentType(type, builder);
+
+// ===========================================================================
 // VIEWER: scene, assembly playback and UI
 // ===========================================================================
 
@@ -1145,6 +1835,31 @@ const waitForFrame = () => new Promise(resolve => {
     setTimeout(finish, 120);                       // never wait forever (e.g. in a background tab)
 });
 const viewportSize = () => ({ width: Math.max(1, container.clientWidth), height: Math.max(1, container.clientHeight) });
+
+// The backend validates plans, but older or hand-edited plans may not be perfect: repair what is repairable
+// here so a single bad value cannot stop the whole scene from rendering.
+function sanitizePlan(p) {
+    const vec = (v, fallback) => (isVec(v) ? v : fallback);
+    p.camera = p.camera || {};
+    p.camera.position = vec(p.camera.position, [0.3, 0.25, 0.4]);
+    p.camera.target = vec(p.camera.target, [0, 0.02, 0]);
+    p.components = Array.isArray(p.components) ? p.components : [];
+    p.assembly_steps = Array.isArray(p.assembly_steps) ? p.assembly_steps : [];
+    const stepOf = new Map();
+    for (const step of p.assembly_steps) for (const id of Array.isArray(step.component_ids) ? step.component_ids : []) stepOf.set(id, step.step);
+    for (const c of p.components) {
+        c.position = vec(c.position, [0, 0, 0]);
+        c.rotation = vec(c.rotation, [0, 0, 0]);
+        c.dimensions = isVec(c.dimensions) && c.dimensions.every(d => d > 0) ? c.dimensions : [0.05, 0.05, 0.05];
+        c.opacity = Number.isFinite(c.opacity) ? clamp(c.opacity, 0, 1) : 1;
+        if (!Number.isInteger(c.assembly_step)) c.assembly_step = Number.isInteger(stepOf.get(c.id)) ? stepOf.get(c.id) : 1;   // recover it from the step that lists the part
+        if (typeof c.color !== "string" || !HEX_COLOR.test(c.color)) c.color = "#888888";
+    }
+    for (const step of p.assembly_steps) step.component_ids = Array.isArray(step.component_ids) ? step.component_ids : [];
+}
+sanitizePlan(plan);
+// Big assemblies get lighter models automatically (a component can still ask for its own model_quality).
+setDefaultQuality(plan.components.length <= 12 ? "high" : plan.components.length <= 40 ? "medium" : "low");
 
 /* ------------------------- renderer, camera, controls -------------------- */
 
@@ -1205,19 +1920,39 @@ import("https://cdn.jsdelivr.net/npm/three@0.180.0/examples/jsm/environments/Roo
 const meshes = new Map();
 let currentStep = 0, busy = false, playing = false, animationToken = 0, playRun = 0;
 
+// Shadows: glass lenses and text labels must not cast hard rectangular shadows.
+function flagShadows(root) {
+    root.traverse(object => {
+        if (!object.isMesh) return;
+        const base = materialBase.get(materialsOf(object)[0]);
+        const label = object.userData.isLabel === true;
+        object.castShadow = !label && !(base && base.transparent && base.opacity < 0.9);
+        object.receiveShadow = !label;
+    });
+}
+
+// Last resort when a model cannot be built at all: a translucent box of the right size.
+function placeholderMesh(component) {
+    const d = dimsOf(component);
+    return new THREE.Mesh(new THREE.BoxGeometry(d[0], d[1], d[2]),
+        new THREE.MeshStandardMaterial({ color: 0xff5577, roughness: 0.6, transparent: true, opacity: 0.6 }));
+}
+
 function buildComponentRoot(component) {
-    const root = createDetailedComponent(component);
+    let root;
+    try {
+        root = createDetailedComponent(component);
+        prepareComponentMaterials(root);
+    } catch (error) {
+        console.error(`Could not build "${component.id}"; showing a placeholder box.`, error);
+        root = placeholderMesh(component);
+        prepareComponentMaterials(root);
+    }
     root.position.set(...component.position);
     root.rotation.set(...component.rotation);
     root.visible = false;
     root.userData.component = component;
-    prepareComponentMaterials(root);
-    root.traverse(object => {
-        if (!object.isMesh) return;
-        const base = materialBase.get(materialsOf(object)[0]);
-        object.castShadow = !(base && base.transparent && base.opacity < 0.9);   // glass lenses don't cast hard shadows
-        object.receiveShadow = true;
-    });
+    flagShadows(root);
     return root;
 }
 
@@ -1251,6 +1986,8 @@ for (const component of plan.components) {
     chip.className = "component-chip";
     chip.textContent = component.name;
     chip.title = `${component.component_type || "generic"} \u00b7 ${component.dimensions_verified ? "verified" : "estimated"} dimensions`
+        + (component.manufacturer ? ` \u00b7 ${component.manufacturer}` : "")
+        + (component.part_number ? ` \u00b7 ${component.part_number} (as supplied, not verified)` : "")
         + (component.function ? ` \u00b7 ${component.function}` : "");
     chip.addEventListener("click", () => flashComponent(component.id));
     componentList.appendChild(chip);
@@ -1358,8 +2095,77 @@ function frameDevice() {
     controls.update();
 }
 
+// Parts far smaller than the whole device would be sub-pixel at the framing distance, so they get a small
+// always-visible locator dot (a screen-space point that fades in and out with the part).
+function addLocatorMarkers() {
+    const threshold = deviceRadius * 0.012;
+    for (const component of plan.components) {
+        const root = meshes.get(component.id);
+        const size = new THREE.Box3().expandByObject(root).getSize(new THREE.Vector3());
+        if (Math.max(size.x, size.y, size.z) >= threshold) continue;
+        const geometry = new THREE.BufferGeometry();
+        geometry.setAttribute("position", new THREE.BufferAttribute(new Float32Array([0, 0, 0]), 3));
+        const material = new THREE.PointsMaterial({
+            color: 0xff7a1a, size: 7, sizeAttenuation: false, transparent: true, opacity: 0.9, depthTest: false
+        });
+        snapshotMaterial(material);
+        const marker = new THREE.Points(geometry, material);
+        marker.userData.isMarker = true;
+        marker.renderOrder = 10;
+        root.add(marker);
+    }
+}
+
+/* Optional high-detail models. The server decides which component types may use a .glb/.gltf file (see
+   CIRCUITPILOT_MODEL_ASSETS in views.py); the AI never supplies URLs. With no assets registered this does nothing. */
+const modelAssets = (() => {
+    try {
+        const element = document.getElementById("model-assets-data");
+        return element ? JSON.parse(element.textContent) : {};
+    } catch (error) {
+        return {};
+    }
+})();
+
+// Scales a loaded model uniformly to fit inside the component's bounding box and centres it.
+function fitModelToBox(model, dims) {
+    model.position.set(0, 0, 0);
+    model.scale.set(1, 1, 1);
+    const box = new THREE.Box3().setFromObject(model);
+    const size = box.getSize(new THREE.Vector3()), center = box.getCenter(new THREE.Vector3());
+    const ratios = [dims[0] / size.x, dims[1] / size.y, dims[2] / size.z].filter(Number.isFinite);
+    const fit = ratios.length ? Math.min(...ratios) : 1;
+    model.scale.set(fit, fit, fit);
+    model.position.set(-center.x * fit, -center.y * fit, -center.z * fit);
+    const holder = new THREE.Group();
+    holder.add(model);
+    return holder;
+}
+
+async function loadModelAsset(component, root) {
+    const asset = modelAssets[component.component_type];
+    if (!asset || !asset.url) return;
+    try {
+        const url = new URL(asset.url, window.location.href);
+        if (url.origin !== window.location.origin) throw new Error("model assets must be served from this site");
+        const { GLTFLoader } = await import("https://cdn.jsdelivr.net/npm/three@0.180.0/examples/jsm/loaders/GLTFLoader.js");
+        const gltf = await new GLTFLoader().loadAsync(url.href);
+        const holder = fitModelToBox(gltf.scene, dimsOf(component));
+        for (const child of [...root.children]) root.remove(child);
+        root.add(holder);
+        prepareComponentMaterials(root);
+        flagShadows(root);
+        if (root.visible) setRootOpacity(root, component.opacity);
+        root.userData.modelSource = { license: asset.license, source: asset.source, author: asset.author };
+    } catch (error) {
+        console.warn(`Could not load the 3D model for "${component.component_type}"; keeping the built-in model.`, error);
+    }
+}
+
+addLocatorMarkers();
 configureScene();
 frameDevice();
+for (const component of plan.components) loadModelAsset(component, meshes.get(component.id));
 
 /* ------------------------------- assembly state --------------------------- */
 
@@ -1575,8 +2381,132 @@ function render() {
     renderer.render(scene, camera);
 }
 
+/* ----------------------- electrical model and SPICE results ---------------------- */
+
+// Everything here is built with textContent, never innerHTML.
+const electrical = plan.electrical || null;
+const simBtn = $("sim-btn"), simResults = $("sim-results"), electricalSummary = $("electrical-summary");
+
+function el(tag, text, className) {
+    const node = document.createElement(tag);
+    if (text !== undefined && text !== null) node.textContent = text;
+    if (className) node.className = className;
+    return node;
+}
+
+function formatSI(value, unit) {
+    if (!Number.isFinite(value)) return "n/a";
+    if (value === 0) return `0 ${unit}`;
+    const prefixes = [[1e9, "G"], [1e6, "M"], [1e3, "k"], [1, ""], [1e-3, "m"], [1e-6, "\u00b5"], [1e-9, "n"], [1e-12, "p"]];
+    const a = Math.abs(value);
+    const [scale, prefix] = prefixes.find(([f]) => a >= f) || prefixes[prefixes.length - 1];
+    return `${+(value / scale).toPrecision(4)} ${prefix}${unit}`;
+}
+
+function describeElectrical(c) {
+    const p = c.parameters || {};
+    switch (c.component_type) {
+        case "resistor": return formatSI(p.resistance_ohms, "\u03a9");
+        case "capacitor": return formatSI(p.capacitance_f, "F");
+        case "inductor": return formatSI(p.inductance_h, "H");
+        case "battery": return formatSI(p.voltage_v, "V");
+        case "led": return `${p.color || "generic"} LED (generic model)`;
+        case "diode": return "generic silicon diode";
+        case "zener_diode": return `${formatSI(p.zener_voltage_v, "V")} zener`;
+        case "switch": return p.state === "closed" ? "closed" : "open";
+        default: return "";
+    }
+}
+
+function renderElectricalSummary() {
+    if (!electrical || !electricalSummary) return;
+    electricalSummary.textContent = "";
+    const parts = el("ul", undefined, "warning-list");
+    for (const c of electrical.components || []) {
+        const estimated = Object.values(c.parameter_basis || {}).some(basis => basis !== "user_specified");
+        parts.appendChild(el("li", `${c.reference_designator} \u00b7 ${c.component_type} \u00b7 ${describeElectrical(c)}${estimated ? " (assumed values)" : ""}`));
+    }
+    electricalSummary.appendChild(parts);
+    const nets = el("ul", undefined, "warning-list");
+    for (const n of electrical.nets || []) {
+        nets.appendChild(el("li", `Net ${n.name}: ${(n.connections || []).map(x => `${x.ref}.${x.pin}`).join(", ")}`));
+    }
+    electricalSummary.appendChild(nets);
+}
+
+function simTable(headers, rows) {
+    const table = el("table", undefined, "sim-table");
+    const head = el("tr");
+    headers.forEach(h => head.appendChild(el("th", h)));
+    table.appendChild(head);
+    rows.forEach(row => { const tr = el("tr"); row.forEach(cell => tr.appendChild(el("td", cell))); table.appendChild(tr); });
+    return table;
+}
+
+function renderSimulationResult(result) {
+    if (!simResults) return;
+    simResults.textContent = "";
+    const ok = result.status === "completed";
+    simResults.appendChild(el("p", ok
+        ? `SPICE simulation completed${result.engine && result.engine.version ? ` (${result.engine.version})` : ""}. `
+          + "This is a numerical result using generic models; it does not prove a physical build is safe or will behave identically."
+        : `Simulation not completed (${result.status}): ${result.message || "no details"}`, ok ? "sim-ok" : "sim-bad"));
+    if (!ok) return;
+    if (result.nodes && result.nodes.length) {
+        simResults.appendChild(simTable(["Net", "Voltage"], result.nodes.map(n => [n.net, formatSI(n.voltage_v, "V")])));
+    }
+    const rows = [...(result.sources || []), ...(result.components || [])];
+    if (rows.length) {
+        simResults.appendChild(simTable(["Part", "Voltage", "Current", "Power"],
+            rows.map(r => [`${r.ref} (${r.type})`, formatSI(r.voltage_v, "V"), formatSI(r.current_a, "A"), formatSI(r.power_w, "W")])));
+    }
+    if (result.analytic) {
+        const a = result.analytic;
+        simResults.appendChild(el("p", `Hand calculation (same model): ${formatSI(a.model_current_a, "A")}; simplified fixed-Vf estimate: ${formatSI(a.fixed_vf_current_a, "A")}. `
+            + (a.agrees === true ? "Simulation agrees with the hand calculation." : a.agrees === false ? "Simulation DIFFERS from the hand calculation: treat the result with suspicion." : ""), "muted"));
+    }
+    const notes = [...(result.warnings || []), ...(result.notes || [])];
+    if (notes.length) {
+        const list = el("ul", undefined, "warning-list");
+        notes.forEach(n => list.appendChild(el("li", n)));
+        simResults.appendChild(list);
+    }
+}
+
+function csrfToken() {
+    const input = document.querySelector ? document.querySelector("[name=csrfmiddlewaretoken]") : null;
+    return input ? input.value : "";
+}
+
+async function runSimulation() {
+    const url = simBtn && simBtn.dataset ? simBtn.dataset.url : "";
+    if (!electrical || !url) return;
+    simBtn.disabled = true;
+    simResults.textContent = "Running ngspice\u2026";
+    try {
+        const response = await fetch(url, {
+            method: "POST", credentials: "same-origin",
+            headers: { "Content-Type": "application/json", "X-CSRFToken": csrfToken() },
+            body: JSON.stringify({ electrical })
+        });
+        const data = await response.json().catch(() => null);
+        if (!data) throw new Error(`Unexpected response from the server (HTTP ${response.status}).`);
+        renderSimulationResult(data);
+    } catch (error) {
+        renderSimulationResult({ status: "failed", message: String(error && error.message ? error.message : error) });
+    } finally {
+        simBtn.disabled = false;
+    }
+}
+
+renderElectricalSummary();
+if (simBtn) simBtn.addEventListener("click", runSimulation);
+
 // Small handle for debugging in the browser console.
-window.circuitPilot = { plan, scene, camera, controls, components: meshes, frameDevice, setStepInstant };
+window.circuitPilot = {
+    plan, scene, camera, controls, components: meshes, frameDevice, setStepInstant,
+    componentTypes: Object.keys(COMPONENT_BUILDERS), modelAssets, fitModelToBox, renderSimulationResult
+};
 
 setStepInstant(0);
 emptyEl.style.display = "none";

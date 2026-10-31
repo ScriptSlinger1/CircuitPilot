@@ -5,11 +5,22 @@ import re
 import time
 
 from django.conf import settings
+from django.http import JsonResponse
 from django.shortcuts import render
+from django.urls import NoReverseMatch, reverse
 from django.views.generic import TemplateView
 from openai import APITimeoutError, OpenAI
 
+
+try: # normal Django layout: spice_sim.py sits next to this file
+    from . import spice_sim
+
+except ImportError: # running the module on its own (tests, scripts)
+    import spice_sim
+
+
 logger = logging.getLogger(__name__)
+
 
 client = OpenAI(
     api_key=settings.OPENAI_API_KEY,
@@ -28,17 +39,15 @@ AI_TOTAL_BUDGET = 180.0      # skip the corrective retry once half of this is us
 # Component types the 3D viewer can draw as detailed multi-part models.
 # "generic" (and plans that predate component_type) use the primitive renderer.
 DETAILED_COMPONENT_TYPES = (
-    "resistor",
-    "led",
-    "capacitor",
-    "battery",
-    "breadboard",
-    "pcb",
-    "wire",
-    "microcontroller",
-    "screw",
-    "motor",
-    "gear",
+    # electronics
+    "resistor", "led", "capacitor", "ceramic_capacitor", "diode", "zener_diode", "transistor", "mosfet",
+    "voltage_regulator", "ic", "push_button", "switch", "potentiometer", "battery", "wire",
+    # prototyping and embedded systems
+    "breadboard", "pcb", "pcb_assembly", "microcontroller", "development_board", "header", "usb_connector",
+    "connector",
+    # mechanical and electromechanical
+    "motor", "servo", "gear", "shaft", "bearing", "screw", "nut", "bracket", "fan", "pulley", "speaker",
+    "buzzer", "sensor",
 )
 SUPPORTED_COMPONENT_TYPES = DETAILED_COMPONENT_TYPES + ("generic",)
 
@@ -79,8 +88,7 @@ Use this exact top-level structure:
 Each component must contain:
 - id: unique lowercase identifier using letters, numbers, and underscores
 - name: human-readable component name
-- component_type: one of resistor, led, capacitor, battery, breadboard, pcb,
-  wire, microcontroller, screw, motor, gear, generic
+- component_type: one of the supported types listed under COMPONENT TYPES, or generic
 - geometry: box, cylinder, sphere, cone, or torus
 - dimensions: exactly three positive numbers
 - position: [x, y, z] in meters (the centre of the part's bounding box)
@@ -93,12 +101,17 @@ Each component must contain:
 - dimensions_verified: boolean (true only if the user gave exact dimensions or
   you are certain of them; false for every estimate)
 - attached_to: null or the ID of another component
+Optional component fields (omit them unless they apply; never invent them):
+- manufacturer, part_number: only if the user supplied them
+- electrical_properties: object of plain values the user stated (for example {"resistance_ohms": 330})
+- model_quality: low, medium or high (detail level of the 3D model)
+Do not include electrical connectivity (pins, nets, netlists); it is produced separately.
 
 COMPONENT TYPES
 Pick the most specific supported component_type for every part. Use "generic"
 only when no listed type fits (brackets, housings, poles, plates, shafts...).
 An LED circuit should use breadboard, battery, resistor, led and wire parts.
-A motor assembly should use motor, screw and gear parts plus generic mounts.
+A motor assembly should use motor, screw, bearing, shaft and gear parts plus generic mounts.
 
 For every component_type except "generic":
 - set geometry to "box";
@@ -154,6 +167,33 @@ Per-type conventions (typical dimensions in meters):
   at the + end. [0.020, 0.030, 0.020] (length includes the shaft).
   color = can colour (#A9AFB7).
 - gear: spur gear; its thinnest dimension is its axis. [0.030, 0.006, 0.030].
+- ceramic_capacitor: disc on two leads, flat face toward +Z. [0.006, 0.016, 0.003].
+- diode: axial, banded cathode end toward +X. [0.0285, 0.0027, 0.0027]. zener_diode: same with a glass body,
+  [0.0285, 0.003, 0.003].
+- transistor: TO-92 package standing along Y, flat marked face toward +Z. [0.0048, 0.0185, 0.0038].
+- mosfet, voltage_regulator: TO-220 package standing along Y, metal tab at the back (-Z).
+  [0.010, 0.029, 0.0045].
+- ic: DIP package on its legs, pin row along X, pin 1 at -X; the length sets the pin count
+  (DIP-8 [0.0095, 0.007, 0.0079], DIP-14 [0.0192, 0.0075, 0.0079], DIP-28 [0.0356, 0.0075, 0.0150]).
+- push_button: 6 mm tactile switch, cap up. [0.006, 0.0075, 0.006]. switch: slide switch, knob up.
+  [0.009, 0.0115, 0.0035]. potentiometer: rotary, shaft up, pins down. [0.017, 0.025, 0.017].
+- header: single row of N pins along X, pins vertical, length = N x 0.00254. [0.0254, 0.0115, 0.0025].
+  usb_connector: receptacle with its opening toward -X. [0.016, 0.011, 0.012].
+  connector: screw terminal block, 5 mm per pole, wire entries toward +Z. [0.010, 0.010, 0.0075].
+- development_board: module board with USB at -X and pin headers on both long edges.
+  [0.051, 0.0085, 0.021]. pcb_assembly: populated board (chip, header, capacitor, SMD parts).
+  [0.080, 0.012, 0.055].
+- servo: hobby servo, length along X, output shaft and horn up. [0.0325, 0.030, 0.0122].
+- shaft: plain steel shaft along its longest dimension. [0.005, 0.060, 0.005].
+- bearing: ball bearing, axis = thinnest dimension. [0.022, 0.007, 0.022]. nut: hex nut, axis = thinnest
+  dimension. [0.0064, 0.0024, 0.0055].
+- bracket: L-bracket, base plate along X, upright plate at -X. [0.040, 0.030, 0.020].
+- fan: square cooling fan, axis = thinnest dimension. [0.040, 0.010, 0.040]. pulley: V-groove pulley, axis =
+  thinnest dimension. [0.030, 0.012, 0.030].
+- speaker: round cone speaker, axis = thinnest dimension, cone toward the + side. [0.040, 0.012, 0.040].
+  buzzer: round buzzer, sound port up. [0.012, 0.0095, 0.012].
+- sensor: small breakout module with a pin header on the -X edge. [0.045, 0.018, 0.020]. Words in the
+  name pick the sensing element: ultrasonic/distance, PIR/motion, temperature/humidity, light/photo.
 - generic: uses geometry and dimensions as described under "Geometry
   conventions" below.
 
@@ -244,6 +284,14 @@ CONCEPT_ONLY_NOTICE = (
     "simulated, mechanically analyzed, or checked against datasheets, so a model "
     "that renders correctly is not evidence that the design works or is safe."
 )
+IDENTITY_NOTICE = (
+    "Manufacturer names and part numbers are shown exactly as supplied in the request. They have not been "
+    "checked against datasheets, and the 3D model is a generic shape, not that manufacturer's part."
+)
+ELECTRICAL_NOTICE = (
+    "The electrical connections listed are explicit data; they were not inferred from how the 3D parts "
+    "touch or overlap. The circuit counts as simulated only if a simulation result says so."
+)
 BATTERY_WARNING = (
     "Batteries can overheat, leak or catch fire if short-circuited, connected "
     "with reversed polarity or overloaded. Check polarity and add suitable "
@@ -258,6 +306,48 @@ MOTOR_WARNING = (
 
 class LandingPageView(TemplateView):
     template_name = 'cpai/landing.html'
+
+
+def _clean_optional_fields(component, warnings):
+    """Keep the optional schema fields only when they are well-formed; never invent or repair values."""
+    label = component["id"]
+    for field in ("manufacturer", "part_number"):
+        if field not in component:
+            continue
+        value = component[field]
+        if (
+            not isinstance(value, str)
+            or not value.strip()
+            or len(value) > 80
+            or any(ord(ch) < 32 for ch in value)
+        ):
+            warnings.append(f"Ignored an invalid {field} for {label}.")
+            del component[field]
+        else:
+            component[field] = value.strip()
+
+    if "electrical_properties" in component:
+        props = component["electrical_properties"]
+        valid = (
+            isinstance(props, dict)
+            and len(props) <= 20
+            and all(
+                isinstance(k, str) and 0 < len(k) <= 40
+                and (
+                    isinstance(v, bool)
+                    or (isinstance(v, (int, float)) and math.isfinite(v))
+                    or (isinstance(v, str) and len(v) <= 80 and all(ord(ch) >= 32 for ch in v))
+                )
+                for k, v in props.items()
+            )
+        )
+        if not valid:
+            warnings.append(f"Ignored invalid electrical_properties for {label}.")
+            del component["electrical_properties"]
+
+    if "model_quality" in component and component["model_quality"] not in ("low", "medium", "high"):
+        warnings.append(f"Ignored an invalid model_quality for {label}.")
+        del component["model_quality"]
 
 
 def validate_assembly_plan(data):
@@ -318,6 +408,7 @@ def validate_assembly_plan(data):
         )
 
     component_ids = set()
+    optional_warnings = []
 
     for component in components:
         if not isinstance(component, dict):
@@ -384,6 +475,8 @@ def validate_assembly_plan(data):
 
         # Never let an estimate be presented as a verified measurement.
         component["dimensions_verified"] = component.get("dimensions_verified") is True
+
+        _clean_optional_fields(component, optional_warnings)
 
     for component in components:
         attached_to = component.get("attached_to")
@@ -481,6 +574,21 @@ def validate_assembly_plan(data):
         ):
             raise ValueError(f"{field} must be a list of strings.")
 
+    data["validation_warnings"].extend(optional_warnings)
+
+    # Optional electrical model. A bad one never rejects the 3D plan: it is dropped and the circuit stays unsimulated.
+    if "electrical" in data:
+        try:
+            data["electrical"] = spice_sim.validate_electrical(
+                data["electrical"], {c["id"]: c["component_type"] for c in components}
+            )
+        except spice_sim.ElectricalError as exc:
+            data["validation_warnings"].append(
+                "The electrical definition was rejected, so the circuit is NOT simulated: "
+                + "; ".join(exc.problems[:5])
+            )
+            del data["electrical"]
+
     return data
 
 
@@ -566,6 +674,50 @@ def check_layout(plan, tol=None):
     return problems
 
 
+def get_model_assets():
+    """Optional GLB/glTF models the viewer may use instead of the built-in shapes.
+
+    Configure in settings.py (nothing is registered by default, and the AI can never supply a URL):
+
+        CIRCUITPILOT_MODEL_ASSETS = {
+            "servo": {
+                "url": "/static/cpai/models/servo.glb",        # same-origin path, .glb or .gltf
+                "license": "CC0-1.0",                          # required
+                "source": "https://example.org/where-it-came-from",   # required
+                "author": "Name",                              # optional
+            },
+        }
+
+    Entries without license and source are ignored, so every asset has documented provenance.
+    """
+    assets = {}
+    configured = getattr(settings, "CIRCUITPILOT_MODEL_ASSETS", None) or {}
+
+    for component_type, meta in configured.items():
+        if component_type not in DETAILED_COMPONENT_TYPES or not isinstance(meta, dict):
+            logger.warning("Ignoring model asset for unsupported type %r.", component_type)
+            continue
+
+        url, license_name, source = meta.get("url"), meta.get("license"), meta.get("source")
+
+        if not all(isinstance(v, str) and v.strip() for v in (url, license_name, source)):
+            logger.warning("Ignoring model asset %r: url, license and source are all required.", component_type)
+            continue
+
+        if not url.startswith("/") or url.startswith("//") or not url.lower().endswith((".glb", ".gltf")):
+            logger.warning("Ignoring model asset %r: url must be a same-origin .glb/.gltf path.", component_type)
+            continue
+
+        assets[component_type] = {
+            "url": url,
+            "license": license_name,
+            "source": source,
+            "author": meta.get("author") if isinstance(meta.get("author"), str) else "",
+        }
+
+    return assets
+
+
 def _append_unique(items, text):
     if text not in items:
         items.append(text)
@@ -579,6 +731,12 @@ def add_standard_notices(plan):
         _append_unique(plan["limitations"], VISUAL_APPROXIMATION_NOTICE)
 
     _append_unique(plan["limitations"], CONCEPT_ONLY_NOTICE)
+
+    if any(c.get("manufacturer") or c.get("part_number") for c in plan["components"]):
+        _append_unique(plan["limitations"], IDENTITY_NOTICE)
+
+    if plan.get("electrical"):
+        _append_unique(plan["limitations"], ELECTRICAL_NOTICE)
 
     if "battery" in types:
         _append_unique(plan["validation_warnings"], BATTERY_WARNING)
@@ -612,11 +770,12 @@ def generate_plan(question):
 
         try:
             ai_res = client.with_options(timeout=AI_REQUEST_TIMEOUT).responses.create(
-                model="gpt-5.6-luna",
+                model="gpt-6-luna",
                 instructions=SYSTEM_PROMPT,
                 input=prompt,
                 text={"format": {"type": "json_object"}},
             )
+
         except APITimeoutError:
             if best_plan is None:
                 raise
@@ -756,64 +915,103 @@ def _assemble_demo_plan(title, description, components, step_defs, camera,
     }
 
 
+def _flow_positions(specs, max_width=0.42, gap=0.012):
+    """Lay parts out left to right in rows that wrap at max_width; returns [(spec, x, z)] centred on the origin."""
+    rows, row, width = [], [], 0.0
+    for spec in specs:
+        w = spec[3][0]
+        if row and width + gap + w > max_width:
+            rows.append((row, width))
+            row, width = [], 0.0
+        width += (gap if row else 0) + w
+        row.append(spec)
+    if row:
+        rows.append((row, width))
+
+    placed, z_cursor = [], 0.0
+    for row, width in rows:
+        depth = max(spec[3][2] for spec in row)
+        x = -width / 2
+        for spec in row:
+            placed.append((spec, x + spec[3][0] / 2, z_cursor + depth / 2))
+            x += spec[3][0] + gap
+        z_cursor += depth + gap
+    shift = (z_cursor - gap) / 2
+    return [(spec, x, z - shift) for spec, x, z in placed]
+
+
 def build_component_showcase():
-    """One of every detailed component type, laid out on the floor."""
+    """One of every detailed component type, resting on the floor, for checking every 3D model."""
     boards = [
         ("breadboard", "Breadboard (830 tie points)", "breadboard", [0.165, 0.0085, 0.055], "#ECEAE3"),
         ("pcb", "Bare circuit board", "pcb", [0.100, 0.0016, 0.070], "#0B6B3A"),
-        ("dev_board", "Microcontroller development board", "microcontroller", [0.0686, 0.0135, 0.0534], "#1F6FB5"),
+        ("pcb_assembly", "Populated circuit board", "pcb_assembly", [0.080, 0.012, 0.055], "#0B6B3A"),
+        ("dev_board", "Microcontroller board", "microcontroller", [0.0686, 0.0135, 0.0534], "#1F6FB5"),
+        ("module_board", "Module-style development board", "development_board", [0.051, 0.0085, 0.021], "#1F7A3D"),
     ]
     electronics = [
         ("resistor", "470 \u03a9 resistor", "resistor", [0.030, 0.0025, 0.0025], "#D9B27C"),
         ("led", "Red LED (5 mm)", "led", [0.0058, 0.030, 0.0058], "#FF2A2A"),
         ("capacitor", "Electrolytic capacitor", "capacitor", [0.0065, 0.020, 0.0065], "#1D3F8F"),
+        ("ceramic_cap", "Ceramic disc capacitor", "ceramic_capacitor", [0.006, 0.016, 0.003], "#D9A441"),
+        ("diode", "Rectifier diode", "diode", [0.0285, 0.0027, 0.0027], "#1B1B1E"),
+        ("zener", "Zener diode", "zener_diode", [0.0285, 0.003, 0.003], "#D98A2B"),
+        ("transistor", "Transistor (TO-92)", "transistor", [0.0048, 0.0185, 0.0038], "#18191C"),
+        ("mosfet", "MOSFET (TO-220)", "mosfet", [0.010, 0.029, 0.0045], "#18191C"),
+        ("regulator", "Voltage regulator (TO-220)", "voltage_regulator", [0.010, 0.029, 0.0045], "#18191C"),
+        ("ic_dip8", "8-pin IC", "ic", [0.0095, 0.0070, 0.0079], "#1B1C20"),
+        ("ic_dip14", "14-pin IC", "ic", [0.0192, 0.0075, 0.0079], "#1B1C20"),
+        ("button", "Push button", "push_button", [0.006, 0.0075, 0.006], "#C0392B"),
+        ("slide_switch", "Slide switch", "switch", [0.009, 0.0115, 0.0035], "#202226"),
+        ("pot", "Potentiometer", "potentiometer", [0.017, 0.025, 0.017], "#A7ADB5"),
         ("battery_aa", "AA cell", "battery", [0.0505, 0.0145, 0.0145], "#D6A21C"),
         ("battery_9v", "9 V battery", "battery", [0.0265, 0.0485, 0.0175], "#222831"),
         ("battery_coin", "Coin cell", "battery", [0.020, 0.0032, 0.020], "#C7CCD2"),
         ("wire", "Jumper wire", "wire", [0.080, 0.002, 0.002], "#D62B1F"),
+        ("header", "10-pin header", "header", [0.0254, 0.0115, 0.0025], "#1D1E22"),
+        ("usb", "USB connector", "usb_connector", [0.016, 0.011, 0.012], "#E9E9EC"),
+        ("terminal", "2-pole screw terminal", "connector", [0.010, 0.010, 0.0075], "#2B6CB0"),
+        ("buzzer", "Buzzer", "buzzer", [0.012, 0.0095, 0.012], "#17181C"),
+        ("sensor_ultrasonic", "Ultrasonic distance sensor", "sensor", [0.045, 0.018, 0.020], "#1A5FB4"),
+        ("sensor_climate", "Temperature and humidity sensor", "sensor", [0.030, 0.012, 0.020], "#1A5FB4"),
     ]
     mechanical = [
         ("screw", "M3 x 10 screw", "screw", [0.0055, 0.012, 0.0055], "#B4B9BF"),
-        ("motor", "Small DC motor", "motor", [0.020, 0.030, 0.020], "#A9AFB7"),
+        ("nut", "M3 nut", "nut", [0.0064, 0.0024, 0.0055], "#9AA0A6"),
+        ("bracket", "L-bracket", "bracket", [0.040, 0.030, 0.020], "#8E959C"),
+        ("shaft", "Steel shaft", "shaft", [0.005, 0.060, 0.005], "#C3C8CE"),
+        ("bearing", "Ball bearing", "bearing", [0.022, 0.007, 0.022], "#B8BEC5"),
         ("gear", "Spur gear", "gear", [0.030, 0.006, 0.030], "#A7ADB5"),
+        ("pulley", "V-groove pulley", "pulley", [0.030, 0.012, 0.030], "#A9AFB7"),
+        ("motor", "Small DC motor", "motor", [0.020, 0.030, 0.020], "#A9AFB7"),
+        ("servo", "Hobby servo", "servo", [0.0325, 0.030, 0.0122], "#2A63C7"),
+        ("fan", "Cooling fan", "fan", [0.040, 0.010, 0.040], "#202226"),
+        ("speaker", "Cone speaker", "speaker", [0.040, 0.012, 0.040], "#2B2B2E"),
     ]
 
     components = []
-
-    def lay_out(rows, z, gap=0.012):
-        total = sum(spec[3][0] for spec in rows) + gap * (len(rows) - 1)
-        x = -total / 2
-        for cid, name, ctype, dims, color in rows:
-            components.append(_component(
-                cid, name, ctype, dims,
-                [x + dims[0] / 2, dims[1] / 2, z], color,
-                f"Showcase of the {ctype} model",
-            ))
-            x += dims[0] + gap
-
-    lay_out(boards, -0.05)
-    lay_out(electronics + mechanical, 0.03)
+    for (cid, name, ctype, dims, color), x, z in _flow_positions(boards + electronics + mechanical):
+        component = _component(cid, name, ctype, dims, [x, dims[1] / 2, z], color, f"Showcase of the {ctype} model")
+        component["model_quality"] = "medium"      # many parts: ask for full detail explicitly
+        components.append(component)
 
     return _assemble_demo_plan(
         "Component showcase",
         "One of every detailed 3D component type, for testing the viewer.",
         components,
         [
-            ("Boards", "Place the breadboard, bare PCB and development board.",
-             [c[0] for c in boards]),
-            ("Electronic parts", "Add the resistor, LED, capacitor, batteries and a wire.",
-             [c[0] for c in electronics]),
-            ("Mechanical parts", "Add the screw, motor and gear.",
-             [c[0] for c in mechanical]),
+            ("Boards", "Place the breadboard, circuit boards and development boards.", [c[0] for c in boards]),
+            ("Electronic parts", "Add the discrete parts, connectors and sensors.", [c[0] for c in electronics]),
+            ("Mechanical parts", "Add the fasteners, shafts, motors and other mechanical parts.", [c[0] for c in mechanical]),
         ],
-        {"position": [0.3, 0.25, 0.4], "target": [0, 0.01, 0]},
+        {"position": [0.5, 0.45, 0.7], "target": [0, 0.01, 0]},
         ["Sizes are typical real-world values used only for illustration."],
         ["Built-in sample plan for testing the viewer; it was not generated by the AI."],
     )
 
 
-def build_led_demo():
-    """LED circuit on a breadboard: 9 V battery -> resistor -> LED -> battery."""
+def _led_demo_visual():
+    """3D part of the LED demo: 9 V battery -> resistor -> LED -> battery on a breadboard."""
     board_top = 0.0085
     battery_x = -0.12
     led_x = 0.036
@@ -879,10 +1077,78 @@ def build_led_demo():
     )
 
 
+def build_led_demo():
+    """The LED circuit demo with its explicit electrical definition (the first SPICE test circuit)."""
+    plan = _led_demo_visual()
+    plan["electrical"] = spice_sim.build_led_circuit(
+        supply_v=9.0, resistance_ohms=470.0, color="red",
+        visual_ids={"battery": "battery_9v", "resistor": "resistor", "led": "led"},
+    )
+    return plan
+
+
 DEMO_PLAN_BUILDERS = {
     "components": build_component_showcase,
     "led": build_led_demo,
 }
+
+
+MAX_SIMULATION_REQUEST_BYTES = 64_000
+
+
+def _simulation_enabled():
+    return bool(getattr(settings, "CIRCUITPILOT_ENABLE_SIMULATION", False))
+
+
+def _simulate_url():
+    """URL of simulate_view, or None when simulation is off or the route has not been added to urls.py."""
+    if not _simulation_enabled():
+        return None
+
+    try:
+        return reverse("cpai_simulate")
+    except NoReverseMatch:
+        return None
+
+
+def simulate_view(request):
+    """POST {"electrical": {...}} -> JSON result of a real ngspice run (or an honest failure status).
+
+    Off unless settings.CIRCUITPILOT_ENABLE_SIMULATION is True, because it starts an external program.
+    Django's CSRF protection applies. Add login or rate limiting before exposing it publicly.
+    """
+    if request.method != "POST":
+        return JsonResponse({"status": "failed", "message": "POST required."}, status=405)
+
+    if not _simulation_enabled():
+        return JsonResponse(
+            {"status": "unavailable",
+             "message": "Simulation is switched off on this server (CIRCUITPILOT_ENABLE_SIMULATION)."},
+            status=403,
+        )
+
+    if len(request.body) > MAX_SIMULATION_REQUEST_BYTES:
+        return JsonResponse({"status": "invalid_circuit", "message": "Request too large."}, status=413)
+
+    try:
+        payload = json.loads(request.body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return JsonResponse({"status": "invalid_circuit", "message": "Request body is not valid JSON."}, status=400)
+
+    electrical = payload.get("electrical") if isinstance(payload, dict) else None
+
+    try:
+        timeout = float(getattr(settings, "CIRCUITPILOT_SIMULATION_TIMEOUT", 10.0))
+        result = spice_sim.simulate(
+            electrical,
+            ngspice_path=getattr(settings, "CIRCUITPILOT_NGSPICE_PATH", None),
+            timeout=timeout,
+        )
+    except Exception:
+        logger.exception("CircuitPilot simulation crashed.")
+        result = {"status": "failed", "message": "The simulation could not be run."}
+
+    return JsonResponse(result)
 
 
 def main_func_temp(request):
@@ -941,5 +1207,7 @@ def main_func_temp(request):
             "question": question,
             "assembly_plan": assembly_plan,
             "error": error,
+            "model_assets": get_model_assets(),
+            "simulate_url": _simulate_url(),
         },
     )
